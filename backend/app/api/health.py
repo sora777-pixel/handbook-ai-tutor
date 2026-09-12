@@ -6,6 +6,7 @@ from app.core.config import get_settings
 from app.core.db import engine
 from app.services.llm.router import ModelRouter
 from app.services.ocr import describe_ocr
+from app.services.stt import KNOWN_STT_PROVIDERS
 
 router = APIRouter()
 
@@ -23,6 +24,7 @@ async def health() -> dict:
         "task_backend": settings.task_backend,
         "storage_backend": settings.storage_backend,
         "stt_provider": settings.stt_provider,
+        "stt_providers": list(KNOWN_STT_PROVIDERS),
         "rag_provider": settings.rag_provider,
         "storage_location": (
             settings.s3_endpoint if settings.storage_backend == "minio" else settings.local_storage_path

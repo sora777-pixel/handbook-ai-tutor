@@ -67,6 +67,12 @@ cd ..
 2. 找到 `DEEPSEEK_API_KEY=`，在等号后面填上你的 Key，保存
 3. 先双击 `stop.bat`，再双击 `start.vbs` 重启即可
 
+视频/音频课堂转写默认是离线 mock。要用 SiliconFlow 云端识别（法/德/中/英等自动检测，不必改 `start.vbs`）：
+
+1. `.env` 里把 `STT_PROVIDER` 改成 `siliconflow`
+2. 填写同一个 `SILICONFLOW_API_KEY`（和 LLM 共用，不用另开一把钥匙）
+3. 双击 `stop.bat`，再双击 `start.vbs` 重启
+
 > 密钥只保存在你本地的 `.env` 文件里，不会上传到任何地方（真实密钥已从项目里清空）。
 
 ---

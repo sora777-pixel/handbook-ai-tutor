@@ -48,6 +48,8 @@ type Health = {
   storage_backend: string;
   storage_location: string;
   db: string;
+  stt_provider?: string;
+  stt_providers?: string[];
 };
 
 const MODALITY_LABEL: Record<string, { label: string; icon: React.ReactNode }> = {
@@ -202,6 +204,13 @@ export default function LlmSettingsPage() {
             value={health.data?.llm_provider_embed || "（自动）"}
             loading={health.isLoading}
             tone="success"
+          />
+          <KpiCard
+            icon={<Volume2 className="h-4 w-4" />}
+            label="语音转写 STT"
+            value={health.data?.stt_provider || "—"}
+            loading={health.isLoading}
+            tone="info"
           />
         </div>
 
