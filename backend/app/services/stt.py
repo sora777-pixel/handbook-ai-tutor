@@ -1,13 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
+
 from app.core.config import get_settings
+
+KNOWN_STT_PROVIDERS = ("mock", "faster_whisper", "siliconflow")
+
+# Same bar as LLM routing: a leftover "xxx" / "changeme" must not count as configured.
+_PLACEHOLDER_KEYS = {"-", "none", "null", "changeme", "your-key", "your_api_key", "xxx", "todo"}
+_MIN_KEY_LEN = 8
+
+
+class STTConfigError(RuntimeError):
+    """Raised when STT cannot be resolved to a usable provider.
+
+    Deliberately loud: silently falling back to MockSTT hides a missing
+    SiliconFlow key behind a fake photosynthesis lesson.
+    """
+
+
+def _usable_api_key(value: str | None) -> bool:
+    raw = (value or "").strip()
+    if len(raw) < _MIN_KEY_LEN:
+        return False
+    return raw.lower() not in _PLACEHOLDER_KEYS
 
 
 @dataclass
@@ -237,10 +261,146 @@ def _split_wav_sync(path: Path, chunk_seconds: float) -> list[tuple[Path, float]
     return [(p, i * chunk_seconds) for i, p in enumerate(pieces)]
 
 
+def _audio_content_type(path: Path) -> str:
+    return {
+        ".wav": "audio/wav",
+        ".mp3": "audio/mpeg",
+        ".mp4": "audio/mp4",
+        ".m4a": "audio/mp4",
+        ".webm": "audio/webm",
+        ".flac": "audio/flac",
+        ".ogg": "audio/ogg",
+    }.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _as_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _siliconflow_http_error(resp: httpx.Response) -> str:
+    """Turn a vendor 4xx/5xx into one readable line (not a stack dump)."""
+    detail = (resp.text or "").strip()
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            detail = str(err.get("message") or err.get("msg") or err)
+        elif err:
+            detail = str(err)
+        else:
+            detail = str(body.get("message") or body.get("msg") or detail)
+    elif isinstance(body, str) and body.strip():
+        detail = body.strip()
+    detail = " ".join(detail.split())[:300]
+    return f"SiliconFlow STT request failed (HTTP {resp.status_code}): {detail or 'no error body'}"
+
+
+class SiliconFlowSTT(STTProvider):
+    """Cloud STT via SiliconFlow's OpenAI-compatible audio transcriptions API.
+
+    Official request (2026-09): multipart ``file`` + ``model`` only. Official
+    response is ``{text}``. If a live payload also includes ``segments`` with
+    timestamps, those are used; otherwise one segment spans the probed duration.
+    """
+
+    name = "siliconflow"
+    DEFAULT_MODEL = "FunAudioLLM/SenseVoiceSmall"
+    DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        key = os.environ.get("SILICONFLOW_API_KEY", "")
+        if not _usable_api_key(key):
+            raise STTConfigError(
+                "STT_PROVIDER=siliconflow but SILICONFLOW_API_KEY is missing, blank, "
+                "or still a placeholder. Put a real key in .env (SILICONFLOW_API_KEY=...) "
+                "and restart. This key is shared with the SiliconFlow LLM provider; "
+                "the provider will not fall back to mock."
+            )
+        self.api_key = key.strip()
+        self.model = (settings.stt_siliconflow_model or self.DEFAULT_MODEL).strip() or self.DEFAULT_MODEL
+        base = (settings.stt_siliconflow_base_url or self.DEFAULT_BASE_URL).strip() or self.DEFAULT_BASE_URL
+        self.base_url = base.rstrip("/")
+
+    async def transcribe(self, audio_path: Path) -> list[TranscriptSegment]:
+        url = f"{self.base_url}/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            async with httpx.AsyncClient(timeout=180.0, trust_env=True) as client:
+                with audio_path.open("rb") as fh:
+                    resp = await client.post(
+                        url,
+                        headers=headers,
+                        files={"file": (audio_path.name or "audio.wav", fh, _audio_content_type(audio_path))},
+                        data={"model": self.model},
+                    )
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"SiliconFlow STT request failed: {exc}") from exc
+
+        if resp.status_code >= 400:
+            raise RuntimeError(_siliconflow_http_error(resp))
+
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"SiliconFlow STT returned a non-JSON body (HTTP {resp.status_code})."
+            ) from exc
+
+        return await self._segments_from_payload(audio_path, payload)
+
+    async def _segments_from_payload(
+        self, audio_path: Path, payload: object
+    ) -> list[TranscriptSegment]:
+        raw_segs = payload.get("segments") if isinstance(payload, dict) else None
+        if isinstance(raw_segs, list) and raw_segs:
+            out: list[TranscriptSegment] = []
+            for item in raw_segs:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                start = _as_float(item.get("start"), 0.0)
+                end = _as_float(item.get("end"), start)
+                if end < start:
+                    end = start
+                out.append(TranscriptSegment(start=start, end=end, text=text))
+            if out:
+                return out
+
+        text = ""
+        if isinstance(payload, dict):
+            text = str(payload.get("text") or "").strip()
+        elif isinstance(payload, str):
+            text = payload.strip()
+        if not text:
+            raise RuntimeError(
+                "SiliconFlow STT returned empty text. The recording may have no usable speech."
+            )
+        duration = await probe_duration(audio_path)
+        if duration <= 0:
+            duration = 1.0
+        return [TranscriptSegment(start=0.0, end=duration, text=text)]
+
+
 def get_stt() -> STTProvider:
-    if get_settings().stt_provider == "faster_whisper":
+    name = (get_settings().stt_provider or "mock").strip().lower()
+    if name == "siliconflow":
+        return SiliconFlowSTT()
+    if name == "faster_whisper":
         return FasterWhisperSTT()
-    return MockSTT()
+    if name == "mock":
+        return MockSTT()
+    raise STTConfigError(
+        f"Unknown STT_PROVIDER={name!r}. Use mock, faster_whisper, or siliconflow."
+    )
 
 
 @dataclass

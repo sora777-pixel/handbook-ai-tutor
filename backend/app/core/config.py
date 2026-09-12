@@ -110,12 +110,17 @@ class Settings(BaseSettings):
 
     rag_provider: str = "llamaindex"  # llamaindex | pgvector
     embedding_dim: int = 1536
-    stt_provider: str = "mock"  # mock | faster_whisper
+    stt_provider: str = "mock"  # mock | faster_whisper | siliconflow
     # Whisper model size for faster-whisper. small 对中文讲课 + 夹杂外语单词的
     # 识别质量明显好于 base，CPU int8 也能跑；需要更快可降到 base。
     stt_whisper_model: str = "small"
     # VAD 过滤静音段，讲课音频里大段停顿/翻页噪声会显著拖慢并干扰识别。
     stt_whisper_vad: bool = True
+    # SiliconFlow OpenAI-compatible /audio/transcriptions. Default model is
+    # multilingual (auto-detect; do not pin Chinese). Mainland .cn base URL
+    # works without a proxy; override if you need the .com endpoint.
+    stt_siliconflow_model: str = "FunAudioLLM/SenseVoiceSmall"
+    stt_siliconflow_base_url: str = "https://api.siliconflow.cn/v1"
 
     # "" = auto: pick the first provider whose API key is present in the
     # environment, else stay on mock. Set it explicitly (including "mock") to
