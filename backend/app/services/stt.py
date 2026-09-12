@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import httpx
+import os
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
@@ -256,19 +258,111 @@ def _split_wav_sync(path: Path, chunk_seconds: float) -> list[tuple[Path, float]
     return [(p, i * chunk_seconds) for i, p in enumerate(pieces)]
 
 
+# STT providers exposed by /health and the settings page. Anything outside this
+# list is rejected loudly instead of silently falling back to MockSTT.
+KNOWN_STT_PROVIDERS = ("mock", "faster_whisper", "siliconflow")
+
+
+class STTConfigError(RuntimeError):
+    """Missing key or unknown provider — never fall back to mock."""
+
+
+_STT_PLACEHOLDER_KEYS = {
+    "-",
+    "none",
+    "null",
+    "changeme",
+    "your-key",
+    "your_key_here",
+    "your_api_key",
+    "xxx",
+    "todo",
+    "replace-me",
+}
+_STT_MIN_KEY_LEN = 8
+
+
+def _usable_stt_key(value: str | None) -> bool:
+    raw = (value or "").strip()
+    if len(raw) < _STT_MIN_KEY_LEN:
+        return False
+    return raw.lower() not in _STT_PLACEHOLDER_KEYS
+
+
+class SiliconFlowSTT(STTProvider):
+    """Cloud ASR via POST /v1/audio/transcriptions (file + model only)."""
+
+    name = "siliconflow"
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        key = (os.environ.get("SILICONFLOW_API_KEY") or "").strip()
+        if not _usable_stt_key(key):
+            raise STTConfigError(
+                "STT_PROVIDER=siliconflow 但 SILICONFLOW_API_KEY 为空或无效。"
+                "请在 .env 填入密钥后重新导入，不会回退到 mock。"
+            )
+        self._key = key
+        self._model = (
+            getattr(settings, "stt_siliconflow_model", None) or "FunAudioLLM/SenseVoiceSmall"
+        ).strip()
+        base = (
+            getattr(settings, "stt_siliconflow_base_url", None) or "https://api.siliconflow.cn/v1"
+        ).rstrip("/")
+        self._url = f"{base}/audio/transcriptions"
+
+    async def transcribe(self, audio_path: Path) -> list[TranscriptSegment]:
+        duration = await probe_duration(audio_path)
+        filename = audio_path.name or "audio.wav"
+        mime = "audio/wav" if filename.lower().endswith(".wav") else "application/octet-stream"
+        data = audio_path.read_bytes()
+        # Official API: multipart file + model only. language / response_format → 400.
+        async with httpx.AsyncClient(timeout=360.0, trust_env=True) as client:
+            resp = await client.post(
+                self._url,
+                headers={"Authorization": f"Bearer {self._key}"},
+                files={"file": (filename, data, mime)},
+                data={"model": self._model},
+            )
+        if resp.status_code >= 400:
+            raise RuntimeError(f"SiliconFlow STT HTTP {resp.status_code}: {(resp.text or '')[:400]}")
+        payload = resp.json()
+        raw_segs = payload.get("segments") or []
+        out: list[TranscriptSegment] = []
+        for seg in raw_segs:
+            if not isinstance(seg, dict):
+                continue
+            text = str(seg.get("text") or "").strip()
+            if not text:
+                continue
+            out.append(
+                TranscriptSegment(
+                    start=float(seg.get("start") or 0.0),
+                    end=float(seg.get("end") or duration or 0.0),
+                    text=text,
+                )
+            )
+        if out:
+            return out
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            raise RuntimeError("SiliconFlow STT empty text (not a mock lesson); check the audio.")
+        return [TranscriptSegment(start=0.0, end=max(float(duration or 0.0), 0.1), text=text)]
+
+
 def get_stt() -> STTProvider:
     name = (get_settings().stt_provider or "mock").strip().lower()
-    # Some local trees add a SiliconFlow STT adapter. This branch is based on
-    # main without that file — use it when present, never delete the hook.
-    if name in {"siliconflow", "silicon_flow"}:
-        try:
-            from app.services.stt_siliconflow import SiliconFlowSTT  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "STT_PROVIDER=siliconflow 但缺少 stt_siliconflow.py，不会回退到 mock。"
-            ) from exc
+    # Accept historical aliases, but only the canonical KNOWN_STT_PROVIDERS names
+    # are surfaced to users.
+    if name == "silicon_flow":
+        name = "siliconflow"
+    elif name == "faster-whisper":
+        name = "faster_whisper"
+    if name not in KNOWN_STT_PROVIDERS:
+        raise STTConfigError(f"Unknown STT_PROVIDER {name!r}; choose one of {KNOWN_STT_PROVIDERS}")
+    if name == "siliconflow":
         return SiliconFlowSTT()
-    if name in {"faster_whisper", "faster-whisper"}:
+    if name == "faster_whisper":
         return FasterWhisperSTT()
     return MockSTT()
 

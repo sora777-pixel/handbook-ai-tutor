@@ -16,6 +16,11 @@ os.environ["TASK_BACKEND"] = "inline"
 os.environ["STORAGE_BACKEND"] = "local"
 os.environ["LOCAL_STORAGE_PATH"] = str(TEST_ROOT / "storage")
 os.environ["LLM_DEFAULT_PROVIDER"] = "mock"
+# A developer's real .env often pins LLM_PROVIDER_TEXT/EMBED to deepseek /
+# siliconflow. Per-modality vars out-rank LLM_DEFAULT_PROVIDER, so without these
+# the suite would hit real APIs (slow, flaky, non-deterministic). Pin them too.
+os.environ["LLM_PROVIDER_TEXT"] = "mock"
+os.environ["LLM_PROVIDER_EMBED"] = "mock"
 os.environ["STT_PROVIDER"] = "mock"
 os.environ["RAG_PROVIDER"] = "pgvector"
 os.environ["SECRET_KEY"] = "test-secret-key-not-for-production"
