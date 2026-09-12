@@ -239,6 +239,16 @@ def test_known_providers_include_siliconflow() -> None:
     assert KNOWN_STT_PROVIDERS == ("mock", "faster_whisper", "siliconflow")
 
 
+@pytest.mark.asyncio
+async def test_health_lists_siliconflow_among_stt_providers() -> None:
+    from app.api.health import health
+
+    data = await health()
+    assert data["stt_provider"] == "mock"
+    assert data["stt_providers"] == list(KNOWN_STT_PROVIDERS)
+    assert "siliconflow" in data["stt_providers"]
+
+
 def test_unknown_provider_does_not_silently_mock(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("STT_PROVIDER", "not-a-vendor")
     get_settings.cache_clear()
