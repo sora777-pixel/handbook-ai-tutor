@@ -11,10 +11,12 @@ import {
   Eye,
   FileJson,
   History,
+  Layers,
   ListChecks,
   Loader2,
   Send,
   Sparkles,
+  Trash2,
   Upload,
   XCircle,
 } from "lucide-react";
@@ -30,9 +32,11 @@ import type {
   ImportResult,
   QuestionResult,
   Quiz,
+  QuizDeleteOut,
   QuizList,
   QuizQuestion,
   QuizRecord,
+  QuizSummary,
   Source,
   SourceStructure,
 } from "@/lib/types";
@@ -52,6 +56,10 @@ export default function QuizPage() {
   const [banner, setBanner] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
   const [selectedQuizId, setSelectedQuizId] = useState<string | null>(null);
   const [retryIds, setRetryIds] = useState<string[] | null>(null);
+  // Which generated quiz set the confirm dialog is about, and whether the
+  // user also wants its submission records gone.
+  const [deleteTarget, setDeleteTarget] = useState<QuizSummary | null>(null);
+  const [deleteWithAttempts, setDeleteWithAttempts] = useState(false);
 
   useEffect(() => {
     if (!token) router.replace("/login");
@@ -181,6 +189,79 @@ export default function QuizPage() {
     onError: (err) => setBanner({ kind: "err", text: err instanceof Error ? err.message : "导入失败" }),
   });
 
+  // 当前正在展示的那一套（quizzes 为空时回退到显式选择项）。
+  const activeQuizId = quiz?.id || selectedQuizId || "";
+  const activeAttemptCount =
+    records.data?.records.filter((r) => r.quiz_id === deleteTarget?.id).length ?? 0;
+  // 提示文案。注意：作答记录来自另一个查询，loading / 失败时计数不可信，
+  // 所以它只用来措辞，绝不用来决定控件是否可交互。
+  const deleteAttemptHint = records.isLoading
+    ? "正在读取该题组的提交记录…"
+    : activeAttemptCount > 0
+      ? `该题组有 ${activeAttemptCount} 条提交记录；勾选后一并清除，不勾选则仍保留在下方「提交记录存档」。`
+      : "该题组暂无提交记录，勾选与否结果相同。";
+
+  const removeQuiz = useMutation({
+    mutationFn: (vars: { quizId: string; title: string; withAttempts: boolean }) =>
+      api<QuizDeleteOut>(
+        `/api/v1/quizzes/${vars.quizId}?with_attempts=${vars.withAttempts ? "true" : "false"}`,
+        { method: "DELETE" }
+      ),
+    onSuccess: (report, vars) => {
+      const remaining = (quizList.data?.quizzes || []).filter((q) => q.id !== report.quiz_id);
+      const wasActive = activeQuizId === report.quiz_id;
+
+      if (wasActive) {
+        // 删掉的正是当前展示的这一套：先切到剩下的最新一套（没有则回到空态），
+        // 再清空作答态，避免题目区 / 解析区指向已不存在的 quiz。
+        setSelectedQuizId(remaining[0]?.id ?? null);
+        setResult(null);
+        setViewing(null);
+        setRetryIds(null);
+        setDrafts({});
+        generate.reset();
+      }
+
+      setDeleteTarget(null);
+      setDeleteWithAttempts(false);
+
+      // 丢掉这套题已缓存的题目与作答，防止残留数据在新选择下闪现。
+      queryClient.removeQueries({ queryKey: ["quiz", id, report.quiz_id] });
+      void queryClient.invalidateQueries({ queryKey: ["quizzes", id] });
+      void queryClient.invalidateQueries({ queryKey: ["quiz", id] });
+      void queryClient.invalidateQueries({ queryKey: ["quiz-records", id] });
+
+      setBanner({
+        kind: "ok",
+        text:
+          `已删除题组「${vars.title}」：移除 ${report.deleted_questions} 道题目` +
+          (vars.withAttempts
+            ? `、${report.deleted_attempts} 条作答记录`
+            : "，作答记录已保留在下方存档"),
+      });
+    },
+    onError: (err) => {
+      // 关掉弹层再报错，否则横幅会被遮罩挡住看不见。
+      setDeleteTarget(null);
+      setDeleteWithAttempts(false);
+      setBanner({ kind: "err", text: err instanceof Error ? err.message : "删除失败" });
+    },
+  });
+
+  function selectQuiz(quizId: string) {
+    if (quizId === activeQuizId) return;
+    setSelectedQuizId(quizId);
+    setResult(null);
+    setViewing(null);
+    setRetryIds(null);
+    setDrafts({});
+  }
+
+  function openDelete(item: QuizSummary) {
+    setDeleteWithAttempts(false);
+    setDeleteTarget(item);
+  }
+
   return (
     <div className="min-h-screen">
       <AppHeader />
@@ -214,26 +295,69 @@ export default function QuizPage() {
             </Button>
           </div>
         </div>
-        {quizList.data && quizList.data.quizzes.length > 1 && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="text-muted-foreground">历史题组</span>
-            <select
-              className="rounded-md border bg-background px-2 py-1 text-sm"
-              value={selectedQuizId || quiz?.id || ""}
-              onChange={(e) => {
-                setSelectedQuizId(e.target.value);
-                setResult(null);
-                setRetryIds(null);
-                setDrafts({});
-              }}
-            >
-              {quizList.data.quizzes.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.title} · {item.question_count} 题 · {item.created_at || ""}
-                </option>
-              ))}
-            </select>
-          </div>
+        {quizList.data && quizList.data.quizzes.length > 0 && (
+          <Card>
+            <CardHeader className="pb-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                  <Layers className="h-4 w-4" />
+                </span>
+                <div>
+                  <CardTitle className="text-base">历史题组</CardTitle>
+                  <CardDescription>
+                    共 {quizList.data.quizzes.length} 套。点标题切换查看，右侧可逐套删除；重新生成不会覆盖旧题组。
+                  </CardDescription>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="space-y-2">
+              {quizList.data.quizzes.map((item) => {
+                const isActive = item.id === activeQuizId;
+                return (
+                  <div
+                    key={item.id}
+                    className={[
+                      "flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3 transition-colors",
+                      isActive
+                        ? "border-primary/40 bg-primary/[0.04]"
+                        : "border-border/60 bg-card/50 hover:border-border hover:bg-card",
+                    ].join(" ")}
+                  >
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 text-left"
+                      onClick={() => selectQuiz(item.id)}
+                      title={isActive ? "当前正在查看这套题" : "切换到这套题"}
+                    >
+                      <p
+                        className={`truncate text-sm ${isActive ? "font-semibold" : "font-medium"}`}
+                      >
+                        {item.title}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {item.question_count} 题 · {item.sections.length} 个章节
+                        {item.created_at ? ` · ${formatTime(item.created_at)}` : ""}
+                      </p>
+                    </button>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {isActive && <Badge variant="soft">当前</Badge>}
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                        onClick={() => openDelete(item)}
+                        disabled={removeQuiz.isPending || generate.isPending}
+                        title="删除这套练习题"
+                      >
+                        <Trash2 />
+                        删除
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </CardContent>
+          </Card>
         )}
 
         {banner && (
@@ -482,6 +606,80 @@ export default function QuizPage() {
           />
         )}
       </main>
+
+      {deleteTarget && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-foreground/40 p-4 backdrop-blur-sm animate-fade-in"
+          onClick={() => {
+            if (!removeQuiz.isPending) {
+              setDeleteTarget(null);
+              setDeleteWithAttempts(false);
+            }
+          }}
+        >
+          <Card
+            className="w-full max-w-md shadow-lift animate-scale-in"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Trash2 className="h-4 w-4 text-destructive" />
+                删除这套练习题？
+              </CardTitle>
+              <CardDescription className="break-all">
+                「{deleteTarget.title}」· {deleteTarget.question_count} 题 ·{" "}
+                {deleteTarget.sections.length} 个章节
+                {deleteTarget.created_at ? ` · ${formatTime(deleteTarget.created_at)}` : ""}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-border/60 bg-muted/30 p-3 text-sm transition-colors hover:border-border hover:bg-muted/50">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-4 w-4 shrink-0 cursor-pointer accent-destructive"
+                  checked={deleteWithAttempts}
+                  onChange={(e) => setDeleteWithAttempts(e.target.checked)}
+                  disabled={removeQuiz.isPending}
+                />
+                <span>
+                  <span className="font-medium">同时删除该题组的作答记录</span>
+                  <span className="mt-0.5 block text-xs text-muted-foreground">
+                    {deleteAttemptHint}
+                  </span>
+                </span>
+              </label>
+              <p className="text-xs text-muted-foreground">
+                题目与解析会随题组一并删除，且无法恢复；其他题组与原文不受影响。
+              </p>
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  disabled={removeQuiz.isPending}
+                  onClick={() => {
+                    setDeleteTarget(null);
+                    setDeleteWithAttempts(false);
+                  }}
+                >
+                  取消
+                </Button>
+                <Button
+                  variant="destructive"
+                  pending={removeQuiz.isPending}
+                  onClick={() =>
+                    removeQuiz.mutate({
+                      quizId: deleteTarget.id,
+                      title: deleteTarget.title,
+                      withAttempts: deleteWithAttempts,
+                    })
+                  }
+                >
+                  {removeQuiz.isPending ? "删除中…" : "确认删除"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }

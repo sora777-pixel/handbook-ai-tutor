@@ -24,9 +24,11 @@ from app.core.config import BACKEND_DIR, REPO_ROOT, get_settings
 from app.services.storage import get_storage, reset_storage
 from tests.conftest import auth_header
 
+#: Derived from the code's own source of truth instead of duplicated here, so
+#: moving a project default (e.g. the storage root) cannot silently desync the
+#: tests from what the app actually does.
 DEFAULTS = {
-    "local_storage_path": str((REPO_ROOT / "data" / "storage").resolve()),
-    "providers_config_path": str((BACKEND_DIR / "config" / "providers.yaml").resolve()),
+    key: str(Path(value).resolve()) for key, value in runtime_paths.project_defaults().items()
 }
 
 

@@ -56,9 +56,13 @@ ALL_OVERRIDABLE: dict[str, str] = {**OVERRIDABLE, **EMBED_KEYS}
 #: and the UI agree on what each entry means.
 PATHS_META: dict[str, dict[str, str]] = {
     "local_storage_path": {
-        "label": "上传文件存储目录",
+        "label": "用户数据根目录",
         "kind": "directory",
-        "hint": "电子书、视频与图片原件存放处。改到新目录后，已上传的旧文件不会被搬移。",
+        "hint": (
+            "每位用户在此目录下拥有一个以用户 ID 命名的专属文件夹，内含 "
+            "profile（账号元数据）、records（学习记录存档）、resources（导入的学习资源原件）三层。"
+            "改到新目录后，已有用户的旧文件夹不会被搬移。"
+        ),
     },
     "providers_config_path": {
         "label": "LLM 供应商配置文件",

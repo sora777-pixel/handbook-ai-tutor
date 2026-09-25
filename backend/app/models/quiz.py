@@ -25,6 +25,12 @@ class Quiz(Base):
     title: Mapped[str] = mapped_column(String(255))
     prompt_version: Mapped[str] = mapped_column(String(64), default="quiz_generate.v2")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    #: Tombstone for "deleted this version but kept its answer archive".
+    #: quiz_attempts.quiz_id is a NOT NULL foreign key, so a version that still has
+    #: submission records cannot simply be dropped. When set, the version is hidden
+    #: from the picker (and from "latest") but keeps resolving titles in the records
+    #: list. Deleting the records too removes the row for good.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class QuizQuestion(Base):

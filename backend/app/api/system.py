@@ -15,8 +15,10 @@ from typing import Any, Callable
 import yaml
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import BACKEND_DIR, REPO_ROOT, env_var_is_external, get_settings
+from app.core.db import get_db
 from app.core.deps import get_current_user
 from app.core.runtime_paths import (
     EMBED_KEYS,
@@ -32,6 +34,7 @@ from app.core.runtime_paths import (
 )
 from app.models.user import User
 from app.services.storage import reset_storage
+from app.services.workspace import export_records, workspace_report
 
 logger = logging.getLogger("app.paths")
 
@@ -430,3 +433,31 @@ async def test_embed(user: User = Depends(get_current_user)) -> EmbedTestOut:
         dim=result.dim or (len(result.vectors[0]) if result.vectors else 0),
         note=router.embed_note,
     )
+
+
+# ---------------------------------------------------------------- workspace
+
+
+@router.get("/workspace")
+async def get_workspace(user: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Where the caller's own folder is, and what it currently holds.
+
+    Read-only: the three sub-folders are created on registration and refreshed
+    on every login, so this is a diagnostic rather than a control.
+    """
+    return workspace_report(user.id)
+
+
+@router.post("/workspace/export")
+async def export_workspace(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Refresh this account's ``records/`` from the database, on demand.
+
+    Quiz grading already archives automatically; this is the explicit "write my
+    current records out now" button, and it reports both the row counts that
+    were mirrored and the resulting folder shape.
+    """
+    counts = await export_records(db, user.id)
+    return {"exported": counts, "workspace": workspace_report(user.id)}

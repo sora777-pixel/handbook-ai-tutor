@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
+from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
@@ -13,6 +14,7 @@ from app.core.deps import get_current_user
 from app.domain.schemas import (
     QuizAttemptOut,
     QuizAttemptRequest,
+    QuizDeleteOut,
     QuizListOut,
     QuizOut,
     QuizQuestionPublic,
@@ -27,6 +29,7 @@ from app.models.source import Source
 from app.models.user import User
 from app.services.llm.router import ModelRouter
 from app.services.quiz import generate_quiz, grade_attempt, load_details, scoring_note_for
+from app.services.workspace import archive_records
 
 router = APIRouter(prefix="/api/v1", tags=["quiz"])
 
@@ -122,13 +125,21 @@ async def list_quizzes(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> QuizListOut:
-    """All generated quiz versions for a source. Newest first. History is kept."""
+    """All generated quiz versions for a source. Newest first. History is kept.
+
+    Versions tombstoned by a keep-the-archive delete are filtered out here, so the
+    picker only ever shows sets the learner can actually open and answer.
+    """
     await _owned_source(db, source_id, user.id)
     quizzes = (
         (
             await db.execute(
                 select(Quiz)
-                .where(Quiz.source_id == source_id, Quiz.user_id == user.id)
+                .where(
+                    Quiz.source_id == source_id,
+                    Quiz.user_id == user.id,
+                    Quiz.deleted_at.is_(None),
+                )
                 .order_by(Quiz.created_at.desc(), Quiz.id.desc())
             )
         )
@@ -160,7 +171,11 @@ async def get_latest_quiz(
     user: User = Depends(get_current_user),
 ) -> QuizOut:
     await _owned_source(db, source_id, user.id)
-    query = select(Quiz).where(Quiz.source_id == source_id, Quiz.user_id == user.id)
+    query = select(Quiz).where(
+        Quiz.source_id == source_id,
+        Quiz.user_id == user.id,
+        Quiz.deleted_at.is_(None),
+    )
     if quiz_id is not None:
         query = query.where(Quiz.id == quiz_id)
     else:
@@ -169,6 +184,65 @@ async def get_latest_quiz(
     if quiz is None:
         raise HTTPException(status_code=404, detail="No quiz yet")
     return _quiz_out(quiz, await _questions(db, quiz.id))
+
+
+@router.delete("/quizzes/{quiz_id}", response_model=QuizDeleteOut)
+async def delete_quiz(
+    quiz_id: UUID,
+    with_attempts: bool = Query(
+        default=False,
+        description="Also drop this quiz's submission records. False hides the version "
+        "instead, so its answer archive stays readable.",
+    ),
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> QuizDeleteOut:
+    """Remove one generated quiz version.
+
+    `with_attempts=True` erases the version for good: its questions, its submission
+    records and finally the row itself.
+
+    `with_attempts=False` keeps the archive working. `quiz_attempts.quiz_id` is a
+    NOT NULL foreign key, so the row cannot be dropped while records point at it;
+    the version is tombstoned via `deleted_at` instead. It drops out of the picker
+    and out of "latest", its questions are removed, and the records list keeps
+    resolving its title.
+
+    Regenerating and retrying are untouched either way: `generate_quiz` always
+    inserts a fresh row, and the surviving versions keep their own questions.
+    """
+    quiz = (await db.execute(select(Quiz).where(Quiz.id == quiz_id))).scalar_one_or_none()
+    if quiz is None or quiz.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Quiz not found")
+
+    source_id = quiz.source_id
+
+    deleted_attempts = 0
+    if with_attempts:
+        result = await db.execute(
+            delete(QuizAttempt).where(
+                QuizAttempt.quiz_id == quiz_id, QuizAttempt.user_id == user.id
+            )
+        )
+        deleted_attempts = result.rowcount or 0
+
+    questions = await db.execute(delete(QuizQuestion).where(QuizQuestion.quiz_id == quiz_id))
+    deleted_questions = questions.rowcount or 0
+
+    if with_attempts:
+        await db.execute(delete(Quiz).where(Quiz.id == quiz_id))
+    else:
+        quiz.deleted_at = datetime.now(timezone.utc)
+
+    await db.commit()
+
+    return QuizDeleteOut(
+        quiz_id=quiz_id,
+        source_id=source_id,
+        deleted_questions=deleted_questions,
+        deleted_attempts=deleted_attempts,
+        with_attempts=with_attempts,
+    )
 
 
 def _attempt_out(attempt: QuizAttempt, questions: list[QuizQuestion]) -> QuizAttemptOut:
@@ -233,6 +307,9 @@ async def attempt_quiz(
         )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    # Mirror the new score/analysis into the learner's own folder right away, so
+    # 成绩 is archived as it is produced rather than only on the next login.
+    await archive_records(db, user.id)
     return _attempt_out(attempt, await _questions(db, quiz_id))
 
 

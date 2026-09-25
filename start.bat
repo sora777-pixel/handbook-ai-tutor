@@ -15,7 +15,7 @@ REM  AI Learning Tutor - one click local launcher
 REM  - Double-click start.vbs for a fully silent launch (no console window)
 REM  - Double-clicking start.bat directly also works, but shows this launcher text
 REM  - Closing this window does NOT stop services and does NOT erase data
-REM  - Data lives in: backend\tutor.db  and  data\storage\
+REM  - Data lives in: backend\tutor.db  and  data\storage\<user_id>\
 REM ============================================================
 
 REM ---------- 1. Resolve paths from this script location ----------
@@ -196,7 +196,7 @@ echo   App      : http://localhost:3000
 echo   API docs : http://127.0.0.1:8000/docs
 echo.
 echo   Data     : backend\tutor.db   (accounts, sources, quizzes)
-echo              data\storage\      (uploaded files)
+echo              data\storage\<id>\ (profile / records / resources)
 echo   Closing this window keeps services and data intact.
 echo   To stop, run stop.bat (services now run hidden).
 echo   A later start.vbs recycles :8000/:3000 when code or .env changed.

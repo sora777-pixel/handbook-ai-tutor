@@ -288,6 +288,22 @@ class QuizRecordsOut(BaseModel):
     records: list[QuizRecordSummary]
 
 
+class QuizDeleteOut(BaseModel):
+    """Report for removing one generated quiz version.
+
+    With `with_attempts` the version, its questions and its records are gone for
+    good. Without it the version is tombstoned instead, so `deleted_questions` is
+    cleared from the bank while the submission archive keeps working. Either way
+    the other generated versions and the source itself are untouched.
+    """
+
+    quiz_id: UUID
+    source_id: UUID
+    deleted_questions: int = 0
+    deleted_attempts: int = 0
+    with_attempts: bool = False
+
+
 # --------------------------------------------------------------------------
 # Notes
 # --------------------------------------------------------------------------

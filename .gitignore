@@ -19,6 +19,8 @@ frontend/out/
 frontend/coverage/
 npm-debug.log*
 .next/
+# Local npm cache created when npm runs with a project-scoped cache dir.
+.npm-cache/
 
 # Env & secrets
 .env
@@ -45,6 +47,9 @@ backend/config/runtime.json.tmp
 .idea/
 .vscode/
 *.swp
+
+# Local assistant/tool scratch state (machine-specific, never shared)
+.workbuddy/
 
 # OS
 .DS_Store

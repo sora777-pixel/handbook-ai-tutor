@@ -104,9 +104,10 @@ class Settings(BaseSettings):
 
     task_backend: str = "inline"  # arq | inline
     storage_backend: str = "local"  # minio | local
-    # Absolute, and deliberately inside the project folder: an upload lands in
-    # <repo>/data/storage without anyone having to edit a file. The settings page
-    # can re-point it per deployment (see runtime_paths.py).
+    # Absolute, and deliberately inside the project folder: every account gets
+    # <root>/<user_id>/{profile,records,resources} without anyone having to edit
+    # a file. Uploaded originals live in that account's resources/ sub-folder.
+    # The settings page can re-point it per deployment (see runtime_paths.py).
     local_storage_path: str = str(REPO_ROOT / "data" / "storage")
 
     rag_provider: str = "llamaindex"  # llamaindex | pgvector

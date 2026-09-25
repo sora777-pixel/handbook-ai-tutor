@@ -24,4 +24,4 @@ jobs:
           LLM_DEFAULT_PROVIDER: mock
           TASK_BACKEND: inline
           STORAGE_BACKEND: local
-        run: pytest -q tests/test_auth.py tests/test_upload.py tests/test_rag.py tests/test_quiz.py tests/test_llm_mock.py tests/test_embed_routing.py tests/test_front_matter.py tests/test_tutor_export.py tests/test_ffmpeg_missing.py tests/test_quiz_types.py tests/test_tutor_grounding.py
+        run: pytest -q tests/test_auth.py tests/test_upload.py tests/test_rag.py tests/test_quiz.py tests/test_llm_mock.py tests/test_embed_routing.py tests/test_front_matter.py tests/test_tutor_export.py tests/test_ffmpeg_missing.py tests/test_quiz_types.py tests/test_tutor_grounding.py tests/test_workspace.py

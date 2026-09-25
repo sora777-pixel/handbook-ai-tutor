@@ -16,6 +16,11 @@ logger = logging.getLogger("app.migrate")
 #
 # Names are hardcoded constants, never user input.
 SQLITE_COLUMN_UPGRADES: dict[str, dict[str, str]] = {
+    # Tombstone for "deleted this version but kept its answer archive" — see
+    # app/api/quiz.py::delete_quiz.
+    "quizzes": {
+        "deleted_at": "DATETIME",
+    },
     "quiz_questions": {
         "question_type": "VARCHAR(32) DEFAULT 'choice'",
         "section_title": "VARCHAR(255) DEFAULT ''",

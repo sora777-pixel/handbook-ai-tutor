@@ -176,6 +176,15 @@ export type QuizList = {
   quizzes: QuizSummary[];
 };
 
+/** Report for deleting one generated quiz version. */
+export type QuizDeleteOut = {
+  quiz_id: string;
+  source_id: string;
+  deleted_questions: number;
+  deleted_attempts: number;
+  with_attempts: boolean;
+};
+
 export type QuestionResult = {
   question_id: string;
   ordinal: number;

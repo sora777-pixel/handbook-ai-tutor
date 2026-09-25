@@ -38,6 +38,7 @@ from app.models.user import User
 from app.services.library import delete_source_cascade
 from app.services.queue import get_queue
 from app.services.storage import get_storage
+from app.services.workspace import ensure_workspace, resource_key
 
 router = APIRouter(prefix="/api/v1/sources", tags=["sources"])
 
@@ -108,7 +109,8 @@ async def upload_source(
                 "Re-export it as PNG or JPG and try again.",
             ) from None
     source_id = uuid4()
-    key = f"{user.id}/{source_id}/{file.filename or 'upload'}"
+    # The original lands in its owner's own folder: <user_id>/resources/<source_id>/.
+    key = resource_key(user.id, source_id, file.filename)
     storage = get_storage()
     await storage.ensure_ready()
     await storage.put_bytes(key, data, file.content_type or "application/octet-stream")
@@ -524,6 +526,10 @@ async def delete_source(
     report = await delete_source_cascade(
         db, source=source, storage=get_storage(), delete_files=delete_files
     )
+    # Removing the last original can prune the now-empty resources/ folder.
+    # Re-provision so the account keeps its three-folder layout after a delete;
+    # the account is never left without its own folder.
+    ensure_workspace(user.id, user.email, created_at=user.created_at)
     return SourceDeleteOut(
         source_id=report.source_id,
         filename=report.filename,
