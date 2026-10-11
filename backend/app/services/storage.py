@@ -67,7 +67,15 @@ class LocalStorage(StorageProvider):
     async def put_bytes(self, key: str, data: bytes, content_type: str) -> str:
         path = self._resolve(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        try:
+            path.write_bytes(data)
+        except OSError as exc:
+            # Say which path and how long it is: a silent failure here once left
+            # an empty resources folder behind, and the next read reported the
+            # file as missing with no hint that the name never made it to disk.
+            raise OSError(
+                f"无法写入 {path}（路径长度 {len(str(path))}，文件名长度 {len(path.name)}）：{exc}"
+            ) from exc
         return str(path)
 
     async def get_bytes(self, key: str) -> bytes:

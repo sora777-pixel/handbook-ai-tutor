@@ -7,6 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
+import { emitReaderJump } from "@/lib/reader-bus";
 import { CONTENT_TYPE_LABELS, type OutlineEntry, type SourceStructure } from "@/lib/types";
 
 /** Colour per content type, so the split is readable at a glance. */
@@ -118,6 +119,7 @@ export function StructurePanel({
   const resolvedKind = data.kind || kind || "pdf";
   const isVideo = resolvedKind === "video";
   const isImage = resolvedKind === "image";
+  const isEpub = resolvedKind === "epub";
   const chapters = tree.length;
   let visible = 0;
   const walk = (nodes: TreeNode[]) => {
@@ -146,11 +148,24 @@ export function StructurePanel({
         node.printed_page ?? (node.page_number ? node.page_number : null);
       const jumpable = isVideo
         ? Boolean(onSeek) && startTime != null
-        : !isImage && Boolean(onJumpToPage) && printable != null;
+        : isEpub
+          ? node.page_number != null // an EPUB chapter is addressed by its ordinal
+          : !isImage && Boolean(onJumpToPage) && printable != null;
 
       const activate = () => {
         if (isVideo) {
           if (onSeek && startTime != null) onSeek(startTime);
+          return;
+        }
+        if (isEpub) {
+          // The reader owns chapter switching (and the TOC highlight), so the
+          // request goes through the bus rather than through a page jump: the
+          // click must move the book *and* the highlighted row on the left.
+          emitReaderJump({
+            chapter: (node.page_number ?? 1) - 1,
+            title: node.title,
+            from: "structure",
+          });
           return;
         }
         if (onJumpToPage && printable != null) onJumpToPage(printable);
@@ -198,7 +213,9 @@ export function StructurePanel({
                 jumpable
                   ? isVideo
                     ? `跳转到 ${formatClock(startTime)}`
-                    : `跳转到 PDF 第 ${printable} 页`
+                    : isEpub
+                      ? `跳到「${node.title}」并在目录中定位`
+                      : `跳转到 PDF 第 ${printable} 页`
                   : "该条目没有可跳转的位置"
               }
               className={`min-w-0 truncate rounded px-1 text-left ${

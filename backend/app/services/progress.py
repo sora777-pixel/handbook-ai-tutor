@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -9,6 +10,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.models.task import Task
+
+logger = logging.getLogger("app.progress")
 
 
 def _utcnow() -> datetime:
@@ -28,8 +31,14 @@ class ProgressService:
         step: str,
         status: str | None = None,
         message: str | None = None,
-    ) -> Task:
-        task = (await self.session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+    ) -> Task | None:
+        # The task row can be gone: a source deleted mid-parse takes its task
+        # with it (cascade). An update then has nowhere to land, which is not
+        # an error worth a traceback.
+        task = (await self.session.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
+        if task is None:
+            logger.debug("progress update for a deleted task %s ignored", task_id)
+            return None
         task.progress = max(0, min(100, progress))
         task.step = step
         if status:

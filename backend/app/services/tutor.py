@@ -12,6 +12,7 @@ from app.models.source import Source
 from app.models.tutor import TutorMessage
 from app.prompts import load_prompt
 from app.services.llm.base import ChatMessage
+from app.models.chunk import DocumentChunk
 from app.services.llm.router import ModelRouter
 from app.services.rag import get_rag
 from app.services.rag.intent import QueryIntent, parse_intent
@@ -56,6 +57,28 @@ def page_hint(source: Source | None) -> tuple[int, int] | None:
     if last <= first:
         return None
     return first, last
+
+
+def order_citations(citations: list[Citation], used_ids: list[str]) -> list[Citation]:
+    """Return the used citations in the order the model numbered them.
+
+    The answer text says 【1】【2】…, and the panel prints the sources in the order
+    of this list. Keeping retrieval order here (the old behaviour) silently paired
+    every marker with a different passage, so clicking 【2】opened the fourth hit.
+    Unknown ids are dropped; a repeated id is listed once.
+    """
+    by_id = {str(c.chunk_id): c for c in citations}
+    ordered: list[Citation] = []
+    seen: set[str] = set()
+    for cid in used_ids or []:
+        key = str(cid)
+        if key in seen:
+            continue
+        seen.add(key)
+        citation = by_id.get(key)
+        if citation is not None:
+            ordered.append(citation)
+    return ordered
 
 
 async def _load_source(session: AsyncSession, source_id: UUID) -> Source | None:
@@ -110,7 +133,71 @@ async def plan_and_retrieve(
         )
         for h in hits
     ]
+
+    if intent.wants_outline:
+        # "这本书主要讲了什么" cannot be answered from whichever six passages
+        # happen to embed closest to the question: the answer lives in the table
+        # of contents and the opening pages. Put those in front of the excerpts,
+        # whatever the vector search returned, so the model summarises the book
+        # instead of one lucky page.
+        anchors = await _structural_anchors(session, source_id=source_id, limit=6)
+        seen = {str(c.chunk_id) for c in anchors}
+        citations = anchors + [c for c in citations if str(c.chunk_id) not in seen]
     return citations, intent
+
+
+async def _structural_anchors(
+    session: AsyncSession, *, source_id: UUID, limit: int = 6
+) -> list[Citation]:
+    """The outline chunk plus the document's first passages, in reading order.
+
+    Front matter (序/前言) is deliberately included: for "what is this book
+    about" it is often the most informative text in the file, and it used to be
+    skipped because quiz/knowledge sampling starts at 第一章.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(DocumentChunk)
+                .where(DocumentChunk.source_id == source_id)
+                .order_by(DocumentChunk.ordinal)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    outline_row = (
+        await session.execute(
+            select(DocumentChunk)
+            .where(DocumentChunk.source_id == source_id, DocumentChunk.content_type == "outline")
+            .order_by(DocumentChunk.ordinal)
+            .limit(1)
+        )
+    ).scalars().first()
+
+    ordered: list[DocumentChunk] = []
+    if outline_row is not None:
+        ordered.append(outline_row)
+    for row in rows:
+        if outline_row is not None and row.id == outline_row.id:
+            continue
+        ordered.append(row)
+
+    return [
+        Citation(
+            chunk_id=row.id,
+            source_id=row.source_id,
+            locator=row.locator,
+            page_number=row.page_number,
+            printed_page=row.printed_page,
+            section_title=row.section_title,
+            content_type=row.content_type,
+            quote=normalise_text(row.content),
+            score=1.0,
+        )
+        for row in ordered
+    ]
 
 
 async def retrieve_for_tutor(
@@ -228,7 +315,7 @@ async def tutor_reply(
         )
         parsed = parse_model(retry.content, TutorReplySchema)
         used_ids = ground_citation_ids(parsed.citation_chunk_ids, allowed)
-    used = [c for c in citations if str(c.chunk_id) in set(used_ids)]
+    used = order_citations(citations, used_ids)
     user_row = TutorMessage(
         source_id=source_id,
         user_id=user_id,

@@ -25,7 +25,16 @@ import { CONTENT_TYPE_LABELS, type Citation, type ImportResult, type Source } fr
 
 type Msg = { id: string; role: string; content: string; citations: Citation[] };
 
-function CitationCard({ c, onJump }: { c: Citation; onJump?: (c: Citation) => void }) {
+function CitationCard({
+  c,
+  onJump,
+  pagePrefix = "PDF p.",
+}: {
+  c: Citation;
+  onJump?: (c: Citation) => void;
+  /** EPUB sources address content by chapter, so their pages are "ch.3". */
+  pagePrefix?: string;
+}) {
   const typeLabel = CONTENT_TYPE_LABELS[c.content_type] ?? c.content_type;
   const canJump = c.start_time != null || c.page_number != null || c.printed_page != null;
   return (
@@ -43,7 +52,7 @@ function CitationCard({ c, onJump }: { c: Citation; onJump?: (c: Citation) => vo
       <div className="flex flex-wrap items-center gap-1.5">
         {c.printed_page != null && <Badge>书内 p.{c.printed_page}</Badge>}
         {c.page_number != null && c.page_number !== c.printed_page && (
-          <Badge variant="outline">PDF p.{c.page_number}</Badge>
+          <Badge variant="outline">{pagePrefix}{c.page_number}</Badge>
         )}
         {c.start_time != null && (
           <Badge variant="outline">
@@ -174,6 +183,7 @@ export default function TutorPage() {
           fileUrl={fileUrl}
           kind={source.data?.kind}
           filename={source.data?.filename}
+          sourceId={id}
         />
       <div className="mx-auto flex w-full min-h-0 flex-1 flex-col">
         <div className="flex items-center justify-between gap-3 border-b py-4">
@@ -228,6 +238,7 @@ export default function TutorPage() {
               content={m.content}
               citations={m.citations}
               onJump={(c) => previewRef.current?.jumpToCitation(c)}
+              pagePrefix={source.data?.kind === "epub" ? "ch." : "PDF p."}
             />
           ))}
           {send.isPending && (
@@ -313,12 +324,15 @@ function Bubble({
   citations,
   pending = false,
   onJump,
+  pagePrefix = "PDF p.",
 }: {
   role: string;
   content: string;
   citations: Citation[];
   pending?: boolean;
   onJump?: (c: Citation) => void;
+  /** EPUB sources address content by chapter, so their pages are "ch.3". */
+  pagePrefix?: string;
 }) {
   const isUser = role === "user";
   return (
@@ -355,7 +369,12 @@ function Bubble({
               <div className="mt-2 space-y-2 border-t pt-2">
                 <p className="text-xs font-medium text-muted-foreground">引用来源</p>
                 {citations.map((c) => (
-                  <CitationCard key={c.chunk_id} c={c} onJump={onJump} />
+                  <CitationCard
+                    key={c.chunk_id}
+                    c={c}
+                    onJump={onJump}
+                    pagePrefix={pagePrefix}
+                  />
                 ))}
               </div>
             )}

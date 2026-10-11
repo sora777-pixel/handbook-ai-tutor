@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 import shutil
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
 from app.core.config import get_settings
 from app.models.chunk import DocumentChunk
@@ -17,9 +22,22 @@ from app.services.chunking import (
     chunk_pages,
     chunk_segments,
 )
+from app.services.epub_parser import (
+    EpubBook,
+    EpubError,
+    parse_epub,
+    relabel_chapter_locators,
+)
 from app.services.knowledge import generate_summary_and_knowledge
-from app.services.layout import analyse_pdf, analyse_text_pages
-from app.services.llm.base import ChatMessage
+from app.services.layout import (
+    FIGURE,
+    Block,
+    PageAnalysis,
+    analyse_pdf,
+    analyse_text_pages,
+    finalise,
+)
+from app.services.llm.base import ChatMessage, ProviderHTTPError
 from app.services.llm.router import ModelRouter
 from app.services.ocr import OcrUnavailable, get_ocr
 from app.services.pdf_parser import (
@@ -32,6 +50,32 @@ from app.core.ffmpeg import FFmpegMissing
 from app.services.llm.router import LLMConfigError
 from app.services.progress import ProgressService
 from app.services.storage import get_storage
+from app.services.workspace import read_source_bytes
+
+logger = logging.getLogger("app.pipeline")
+
+#: Junk that library-site exports append to a filename, stripped when the file
+#: name has to stand in for a missing book title.
+_FILENAME_JUNK = re.compile(
+    r"\s*[\(\[]\s*(z-library|1lib|z-lib|libgen|annas?[- ]archive)[^)\]]*[)\]]",
+    re.IGNORECASE,
+)
+
+
+def _title_from_filename(filename: str | None) -> str:
+    """A readable title out of a messy filename, or "" when there is nothing.
+
+    `上头Obsidian手把手教你用AI做好知识管理 (Shiki实验室) (z-library.sk, ...).epub`
+    becomes `上头Obsidian手把手教你用AI做好知识管理` -- still not a real title
+    page, but far closer than a model's paraphrase.
+    """
+    raw = (filename or "").strip()
+    if not raw:
+        return ""
+    stem = raw.rsplit(".", 1)[0] if "." in raw else raw
+    stem = _FILENAME_JUNK.sub("", stem)
+    stem = re.sub(r"\s*\([^)]*\)\s*$", "", stem).strip(" -_")
+    return stem[:120]
 from app.services.stt import (
     TranscriptSegment,
     extract_audio,
@@ -68,12 +112,15 @@ class IngestPipeline:
         # Provenance of the text extraction, surfaced in the task message so the
         # learner can tell real OCR from a mock transcription.
         self.extraction_note: str | None = None
+        #: The EPUB's own <dc:title>, kept so the book is displayed under the
+        #: name it was published with instead of the model's invented headline.
+        self.book_title: str = ""
 
     async def run(self, source_id: UUID, task_id: UUID) -> None:
         source = (await self.session.execute(select(Source).where(Source.id == source_id))).scalar_one()
         try:
             await self.progress.update(task_id, progress=5, step="download", status="running")
-            data = await get_storage().get_bytes(source.storage_key)
+            data = await read_source_bytes(source, source.user_id)
             if not data:
                 raise IngestError("The stored file is empty.")
 
@@ -81,6 +128,8 @@ class IngestPipeline:
                 chunks = await self._video_chunks(source, task_id, data)
             elif source.kind == "image":
                 chunks = await self._image_chunks(source, task_id, data)
+            elif source.kind == "epub":
+                chunks = await self._epub_chunks(source, task_id, data)
             else:
                 chunks = await self._pdf_chunks(source, task_id, data)
 
@@ -102,7 +151,14 @@ class IngestPipeline:
             # content, and dropping it on top of "lecture-03.mp4" made the file
             # look renamed the moment the import finished. The generated title
             # is still stored on the summary itself.
-            if source.kind != "video":
+            #
+            # A book keeps its *own* title. `21世纪的21位思想家` was relabelled
+            # "当代批判理论家群像：从马克思场域到盖亚入侵" -- a plausible but
+            # invented headline -- because the model title overrode the EPUB
+            # metadata. Metadata wins; the model only fills a blank.
+            if source.kind == "epub":
+                source.title = self.book_title or _title_from_filename(source.filename) or summary.title
+            elif source.kind != "video":
                 source.title = summary.title
             elif not (source.title or "").strip():
                 # A row created before upload started seeding `title` would
@@ -110,11 +166,15 @@ class IngestPipeline:
                 source.title = source.filename
             source.status = "ready"
             source.error_message = None
-            await self.session.commit()
+            if not await self._commit_source():
+                return
             note = getattr(self.router, "embed_note", None)
+            fallback = getattr(self.router, "fallback_note", None)
             detail = f"LLM: {provider.name} / {provider.model_for('summarize')}"
             if self.extraction_note:
                 detail = f"{self.extraction_note} · {detail}"
+            if fallback:
+                detail += f" · {fallback}"
             if note:
                 detail += f" · {note}"
             await self.progress.update(
@@ -138,13 +198,42 @@ class IngestPipeline:
                     pass
             source.status = "failed"
             source.error_message = detail
-            await self.session.commit()
+            # A learner may delete the source while it is still parsing. The row
+            # is then gone, and flushing the change would raise StaleDataError
+            # and spray a traceback for a perfectly reasonable action.
+            await self._commit_source()
             await self.progress.update(
                 task_id, progress=100, step="failed", status="failed", message=detail
             )
             raise
 
     # ------------------------------------------------------------------ pdf
+
+    @staticmethod
+    def _clean_book_title(name: str | None) -> str:
+        return _title_from_filename(name)
+
+    async def _commit_source(self) -> bool:
+        """Commit source changes; False when the row was deleted meanwhile.
+
+        Deleting a source mid-parse is legal and even sensible (the learner
+        changed their mind). The pipeline must then stop quietly instead of
+        failing with "expected to update 1 row(s); 0 were matched".
+        """
+        try:
+            await self.session.commit()
+            return True
+        except (StaleDataError, ObjectDeletedError, InvalidRequestError) as exc:
+            logger.info("source vanished while parsing; dropping its progress (%s)", type(exc).__name__)
+            try:
+                await self.session.rollback()
+                # Drop the stale objects too: a session left holding a modified
+                # row that no longer exists warns on teardown ("state will be
+                # discarded") and keeps the failure alive past its cause.
+                self.session.expunge_all()
+            except Exception:
+                pass
+            return False
 
     async def _pdf_chunks(self, source: Source, task_id: UUID, data: bytes) -> list[RawChunk]:
         await self.progress.update(task_id, progress=15, step="parse_pdf")
@@ -255,6 +344,108 @@ class IngestPipeline:
             )
         await self.progress.update(task_id, progress=40, step="chunk")
         return self._structure_ocr(source, pages_out)
+
+    # ----------------------------------------------------------------- epub
+
+    async def _epub_chunks(self, source: Source, task_id: UUID, data: bytes) -> list[RawChunk]:
+        """EPUB ingestion: XHTML chapters are already structured, so no layout
+        heuristics run -- the parser's typed blocks go straight into the shared
+        section/outline machinery the PDF path built."""
+        await self.progress.update(task_id, progress=15, step="parse_epub")
+        try:
+            book = parse_epub(data)
+        except EpubError as exc:
+            raise IngestError(str(exc)) from exc
+        # The book knows its own name; the model only writes a summary headline.
+        if (book.title or "").strip():
+            self.book_title = book.title.strip()
+
+        await self.progress.update(task_id, progress=25, step="epub_images")
+        await self._epub_image_blocks(source, book)
+
+        # A chapter is a "page": section paths, the outline and citations all
+        # address content by chapter ordinal.
+        pages = [
+            PageAnalysis(page_number=chapter.number, blocks=chapter.blocks, source="epub")
+            for chapter in book.chapters
+        ]
+        doc = finalise(pages)
+        self._record_structure(source, doc)
+
+        counts = ", ".join(
+            f"{kind}:{n}" for kind, n in sorted(doc.tallies.items()) if n
+        )
+        note = f"EPUB 文本层（{len(book.chapters)} 章 / {doc.char_count} 字符 / {len(doc.outline)} 小节）"
+        if counts:
+            note += f" · {counts}"
+        if book.skipped_chapters:
+            note += f" · 跳过 {book.skipped_chapters} 个空白/插图章节"
+        if self.extraction_note:
+            note = f"{self.extraction_note} · {note}"
+        self.extraction_note = note
+
+        await self.progress.update(task_id, progress=40, step="chunk")
+        chunks = chunk_document(doc)
+        return self._relabel_epub_locators(chunks, book)
+
+    async def _epub_image_blocks(self, source: Source, book: EpubBook) -> None:
+        """OCR the meaningful illustrations and append them as figure blocks.
+
+        Mirrors the video path's resilience: an unavailable or failing OCR
+        engine downgrades to an explanatory note -- the text of the book must
+        still reach the learner.
+        """
+        settings = get_settings()
+        cap = max(1, int(settings.ocr_max_pages or 40))
+        pending = [
+            (chapter, image)
+            for chapter in book.chapters
+            for image in chapter.images
+        ]
+        truncated = len(pending) - min(len(pending), cap)
+        pending = pending[:cap]
+        if not pending:
+            return
+
+        try:
+            engine = get_ocr(self.router)
+            result = await engine.transcribe(
+                [(index + 1, image) for index, (_chapter, image) in enumerate(pending)],
+                user_id=source.user_id,
+                source_id=source.id,
+            )
+        except Exception as exc:
+            self.extraction_note = f"插图未转写（{type(exc).__name__}）"
+            return
+
+        by_page = {page.page_number: (page.text or "").strip() for page in result.pages}
+        used = 0
+        for index, (chapter, _image) in enumerate(pending, start=1):
+            text = by_page.get(index, "")
+            if len(text) < 4:
+                continue
+            used += 1
+            chapter.blocks.append(
+                Block(
+                    content=f"[插图转写] {text}",
+                    content_type=FIGURE,
+                    page_number=chapter.number,
+                    page_end=chapter.number,
+                )
+            )
+        note = f"插图 OCR {result.provider}/{result.model}（{used} 张）"
+        if truncated > 0:
+            note += f" · 超出上限跳过 {truncated} 张"
+        self.extraction_note = note
+
+    @staticmethod
+    def _relabel_epub_locators(chunks: list[RawChunk], book: EpubBook) -> list[RawChunk]:
+        """Swap the page-flavoured locator "p.7" for "ch.7 <chapter title>".
+
+        Implemented in ``epub_parser`` so it stays unit-testable without a
+        database session; see ``relabel_chapter_locators``.
+        """
+        return relabel_chapter_locators(chunks, book)
 
     def _structure_ocr(
         self, source: Source, pages_out: list[tuple[int, str]]
@@ -451,9 +642,19 @@ class IngestPipeline:
         if not windows:
             return []
 
-        summaries: list[dict] = []
-        for i, window in enumerate(windows):
-            summaries.append(await self._summarize_window(source, i, window))
+        # Windows are independent and each is one LLM call, so run a few at a
+        # time: a 90-minute lecture used to summarize strictly one window after
+        # another, which dominated the import time.
+        limit = max(1, int(getattr(get_settings(), "summarize_concurrency", 4) or 4))
+        semaphore = asyncio.Semaphore(limit)
+
+        async def guarded(i: int, window: list) -> dict:
+            async with semaphore:
+                return await self._summarize_window(source, i, window)
+
+        summaries = list(
+            await asyncio.gather(*(guarded(i, w) for i, w in enumerate(windows)))
+        )
         failed = sum(1 for s in summaries if s.get("error"))
         if failed:
             self.extraction_note = f"{failed}/{len(summaries)} windows summarized locally"
@@ -611,15 +812,27 @@ class IngestPipeline:
 
 
 def _failing_task(exc: BaseException) -> str | None:
-    """Which routed task is most likely responsible for this ingest exception."""
+    """Which routed task is most likely responsible for this ingest exception.
+
+    Getting this wrong is worse than saying nothing: a failed OCR call through
+    the vision provider was reported as "[deepseek / deepseek-chat] All
+    connection attempts failed" (deepseek had not even been called), which sent
+    the learner to check the wrong vendor's key. `ProviderHTTPError` carries the
+    real provider and model, so prefer it; the textual heuristics below only run
+    when nothing structured is available.
+    """
     if isinstance(exc, FFmpegMissing):
         return None
+    if isinstance(exc, ProviderHTTPError) and exc.task:
+        return exc.task
     text = str(exc)
     lowered = text.lower()
     if isinstance(exc, LLMConfigError) and "embed" in lowered:
         return "embed"
     if "/embeddings" in lowered or "embedding" in lowered:
         return "embed"
+    if "transcribe_image" in lowered or "vision" in lowered:
+        return "transcribe_image"
     if "ffmpeg" in lowered or "ffprobe" in lowered or "winerror 2" in lowered:
         return None
     return "summarize"

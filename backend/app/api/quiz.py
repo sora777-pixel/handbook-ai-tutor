@@ -309,7 +309,7 @@ async def attempt_quiz(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     # Mirror the new score/analysis into the learner's own folder right away, so
     # 成绩 is archived as it is produced rather than only on the next login.
-    await archive_records(db, user.id)
+    await archive_records(db, user.id, user.email)
     return _attempt_out(attempt, await _questions(db, quiz_id))
 
 

@@ -9,7 +9,7 @@ from app.api import api_router
 from app.api.health import router as health_router
 from app.core.config import get_settings
 from app.core.db import engine
-from app.core.migrate import ensure_sqlite_schema
+from app.core.migrate import ensure_sqlite_schema, recover_interrupted_tasks
 from app.core.runtime_paths import apply_overrides
 from app.models import Base
 from app.services.storage import get_storage
@@ -31,6 +31,9 @@ async def lifespan(app: FastAPI):
         applied = await ensure_sqlite_schema(engine)
         if applied:
             print(f"[migrate] sqlite schema upgraded: {', '.join(applied)}")
+        # A task owned by a process that is gone can never finish; fail it now so
+        # the UI stops showing a progress bar that will never move.
+        await recover_interrupted_tasks(engine)
     try:
         await get_storage().ensure_ready()
     except Exception:

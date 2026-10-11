@@ -7,7 +7,7 @@
 
 ## 一、项目概述
 
-Handbook AI Tutor 是一个**完全本地运行**的学习助手：把一份 PDF 或 MP4 交给它，它会自动完成
+Handbook AI Tutor 是一个**完全本地运行**的学习助手：把一份 PDF、MP4 或 EPUB 交给它，它会自动完成
 
 1. 内容解析（PDF 抽文本 / 扫描页 OCR；视频抽音频 + 语音转写）
 2. 结构化加工（摘要、大纲、知识点、学习笔记）
@@ -122,8 +122,8 @@ Handbook AI Tutor 是一个**完全本地运行**的学习助手：把一份 PDF
 ├── data/storage/                # 用户数据根目录（运行时生成，不入库）
 │                                #   <user_id>/{profile,records,resources}
 ├── test/input/                  # 自测用的样例 mp4 / pdf（不入库）
-├── start.vbs / start.bat        # 本地启动（vbs 静默调用 bat）
-├── stop.bat                     # 停止服务
+├── start.bat                    # 本地启动（唯一入口：自愈环境、清理残留、拉起服务）
+│                                #   关闭浏览器后由 scripts/session_watchdog.ps1 自动停止
 ├── docker-compose.yml           # 容器化编排
 └── Makefile                     # make test / backend / frontend / compose / samples
 ```
@@ -205,7 +205,7 @@ make test                               # 等价，显式固定 mock + inline + 
 
 ### 启动方式
 
-- 本地：双击 `start.vbs`（静默调用 `start.bat`），`stop.bat` 停止；两个端口 8000 / 3000。
+- 本地：双击 `start.bat`（唯一入口，启动前自动清理残留进程）；关闭浏览器后看门狗自动停止；两个端口 8000 / 3000。
 - 容器：`docker compose up --build`；迁移由容器启动命令中的 `alembic upgrade head` 完成。
 
 ---

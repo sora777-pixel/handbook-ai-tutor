@@ -53,14 +53,35 @@ _OUTLINE_CUES = (
     "目录",
     "大纲",
     "章节结构",
-    "讲了什么",
-    "讲什么",
     "全书结构",
     "what is this book about",
     "overview of the book",
     "table of contents",
 )
-_SUMMARY_CUES = ("总结一下", "概括", "综述", "整体介绍")
+#: Phrases that ask for the whole document -- but only when the question did not
+#: name a page or a chapter. "第 42 页讲了什么" is a page question, and treating
+#: it as "summarise the book" answered something the learner never asked.
+_WHOLE_BOOK_CUES = (
+    "总结一下",
+    "概括",
+    "综述",
+    "整体介绍",
+    "内容概括",
+    "简介",
+    "讲了哪些",
+    "讲了什么",
+    "讲什么",
+    "全书写了什么",
+    "主要内容",
+    "核心内容",
+    "主要讲",
+    "内容简介",
+    "主旨",
+    "这本书是",
+)
+
+#: Kept as an alias: older code (and prompts) refer to it by this name.
+_SUMMARY_CUES = _WHOLE_BOOK_CUES
 
 _FIGURE_CUES = (
     "插图",
@@ -165,8 +186,10 @@ def parse_intent(message: str, *, page_hint: tuple[int, int] | None = None) -> Q
     )
 
     wants_outline = any(cue in text or cue in lowered for cue in _OUTLINE_CUES)
-    if not wants_outline and any(cue in text for cue in _SUMMARY_CUES):
-        # "概括一下" with no page or chapter named means the whole document.
+    if not wants_outline and any(cue in text or cue in lowered for cue in _WHOLE_BOOK_CUES):
+        # "概括一下" / "主要内容" mean the whole document *only* when the question
+        # named no page and no chapter -- and is short enough to be a request
+        # rather than a paragraph that happens to contain the word.
         wants_outline = not pages and not section_terms and len(text) <= 24
 
     if wants_outline:

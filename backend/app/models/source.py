@@ -18,7 +18,7 @@ class Source(Base):
     course_id: Mapped[UUID | None] = mapped_column(GUID(), ForeignKey("courses.id"), nullable=True)
     filename: Mapped[str] = mapped_column(String(512))
     content_type: Mapped[str] = mapped_column(String(128))
-    kind: Mapped[str] = mapped_column(String(32))  # pdf | video
+    kind: Mapped[str] = mapped_column(String(32))  # pdf | video | image | epub
     storage_key: Mapped[str] = mapped_column(String(1024))
     byte_size: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="uploaded")

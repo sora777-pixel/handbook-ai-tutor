@@ -12,7 +12,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import BACKEND_DIR, get_settings
 from app.models.usage import TokenUsage
 from app.services.llm.anthropic import AnthropicProvider
-from app.services.llm.base import ChatMessage, EmbedResult, LLMProvider, LLMResult
+from app.services.llm.base import (
+    ChatMessage,
+    EmbedResult,
+    LLMProvider,
+    LLMResult,
+    ProviderHTTPError,
+)
 from app.services.llm.mock import MockProvider
 from app.services.llm.ollama import OllamaProvider
 from app.services.llm.models import looks_like_chat_model
@@ -135,6 +141,10 @@ class ModelRouter:
         )
         self.auto_detected = False
         self.embed_note: str | None = None
+        #: Set when a call had to be served by a different vendor than the one
+        #: configured (disabled model, revoked key, rate limit). Surfaced in the
+        #: ingest note so a surprise provider is never invisible.
+        self.fallback_note: str | None = None
         if self.default_name == "mock" and not (self.settings.llm_default_provider or "").strip():
             detected = self._first_provider_with_key()
             if detected:
@@ -533,6 +543,43 @@ class ModelRouter:
 
     # ---------- calls ----------
 
+    def _fallback_candidates(self, task: str, failed: str) -> list[str]:
+        """Other real vendors that could serve `task`, best first.
+
+        Only vendors with a usable key and a model for this task's modality.
+        `mock` is deliberately excluded: silently ingesting a mock summary is
+        worse than an honest failure (see _allow_mock_embed). Order follows the
+        existing AUTO_ORDER / VISION_AUTO_ORDER preferences so a fallback is
+        predictable rather than "whoever happens to be in the yaml".
+        """
+        modality = modality_for(task)
+        specs = self.config.get("providers") or {}
+        specs = {**specs, **self._synthetic_specs}
+        order = VISION_AUTO_ORDER if modality == "vision" else AUTO_ORDER
+        out: list[str] = []
+        for name in order:
+            if name == failed or name == "mock" or name not in self.providers:
+                continue
+            spec = specs.get(name) or self._spec_for(name) or {}
+            if spec.get("type") == "mock":
+                continue
+            key_env = spec.get("api_key_env") or ""
+            if spec.get("type") != "ollama" and key_env and not _usable_key(
+                os.environ.get(key_env)
+            ):
+                continue
+            models = spec.get("models") or {}
+            if modality == "embed":
+                if not self._has_embed_model(name):
+                    continue
+            elif modality == "vision":
+                if not models.get("transcribe_image"):
+                    continue
+            elif not (models.get(task) or models.get("default")):
+                continue
+            out.append(name)
+        return out
+
     async def complete(
         self,
         *,
@@ -545,18 +592,65 @@ class ModelRouter:
         normalized: list[ChatMessage] = [
             m if isinstance(m, ChatMessage) else ChatMessage.model_validate(m) for m in messages
         ]
-        provider = self.provider_for(task)
-        result = await provider.complete(task=task, messages=normalized, json_mode=json_mode)
-        logger.info(
-            "llm task=%s provider=%s model=%s prompt_tokens=%s completion_tokens=%s",
-            task,
-            result.provider,
-            result.model,
-            result.prompt_tokens,
-            result.completion_tokens,
+        primary = self.provider_for(task)
+        attempts: list[str] = []
+        first_error: ProviderHTTPError | None = None
+
+        for name in [primary.name, *self._fallback_candidates(task, primary.name)]:
+            provider = primary if name == primary.name else self.providers[name]
+            try:
+                result = await provider.complete(
+                    task=task, messages=normalized, json_mode=json_mode
+                )
+            except ProviderHTTPError as exc:
+                attempts.append(exc.short)
+                if first_error is None:
+                    first_error = exc
+                if not exc.worth_another_provider:
+                    raise
+                logger.warning(
+                    "llm task=%s provider=%s failed (%s); trying another vendor",
+                    task,
+                    name,
+                    exc.short,
+                )
+                continue
+            if name != primary.name:
+                # Surface the switch: the learner sees which vendor actually
+                # answered, and the ingest note explains a surprise provider.
+                self.fallback_note = (
+                    f"{primary.name} 不可用（{first_error.short if first_error else 'failed'}），"
+                    f"已回退到 {result.provider}/{result.model}"
+                )
+                logger.warning("llm task=%s fallback: %s", task, self.fallback_note)
+            else:
+                self.fallback_note = None
+            logger.info(
+                "llm task=%s provider=%s model=%s prompt_tokens=%s completion_tokens=%s",
+                task,
+                result.provider,
+                result.model,
+                result.prompt_tokens,
+                result.completion_tokens,
+            )
+            await self._record(task, result, user_id=user_id, source_id=source_id)
+            return result
+
+        # Every vendor with a key refused. Surface the first (most likely root
+        # cause) plus every attempt, so the task message is a diagnosis.
+        assert first_error is not None
+        raise ProviderHTTPError(
+            status_code=first_error.status_code,
+            provider=first_error.provider,
+            model=first_error.model,
+            endpoint=first_error.endpoint,
+            vendor_code=first_error.vendor_code,
+            vendor_message=first_error.vendor_message,
+            body_excerpt=(first_error.body_excerpt or "")[:200],
+            task=task,
+        ) from RuntimeError(
+            f"所有已配置密钥的供应商都调用失败（task={task}）。尝试记录： " + " || ".join(attempts)
         )
-        await self._record(task, result, user_id=user_id, source_id=source_id)
-        return result
 
     async def embed(
         self,
@@ -566,28 +660,66 @@ class ModelRouter:
         user_id: UUID | None = None,
         source_id: UUID | None = None,
     ) -> EmbedResult:
-        provider = self.provider_for(task)
-        result = await provider.embed(task=task, texts=texts)
-        logger.info(
-            "llm task=%s provider=%s model=%s vectors=%s",
-            task,
-            result.provider,
-            result.model,
-            len(result.vectors),
+        primary = self.provider_for(task)
+        attempts: list[str] = []
+        first_error: ProviderHTTPError | None = None
+
+        for name in [primary.name, *self._fallback_candidates(task, primary.name)]:
+            provider = primary if name == primary.name else self.providers[name]
+            try:
+                result = await provider.embed(task=task, texts=texts)
+            except ProviderHTTPError as exc:
+                attempts.append(exc.short)
+                if first_error is None:
+                    first_error = exc
+                if not exc.worth_another_provider:
+                    raise
+                logger.warning(
+                    "embed provider=%s failed (%s); trying another vendor", name, exc.short
+                )
+                continue
+            if name != primary.name:
+                self.fallback_note = (
+                    f"{primary.name} 向量接口不可用（{first_error.short if first_error else 'failed'}），"
+                    f"已回退到 {result.provider}/{result.model}"
+                )
+                logger.warning("embed fallback: %s", self.fallback_note)
+            else:
+                self.fallback_note = None
+            logger.info(
+                "llm task=%s provider=%s model=%s vectors=%s",
+                task,
+                result.provider,
+                result.model,
+                len(result.vectors),
+            )
+            await self._record(
+                task,
+                LLMResult(
+                    content="",
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=0,
+                    provider=result.provider,
+                    model=result.model,
+                ),
+                user_id=user_id,
+                source_id=source_id,
+            )
+            return result
+
+        assert first_error is not None
+        raise ProviderHTTPError(
+            status_code=first_error.status_code,
+            provider=first_error.provider,
+            model=first_error.model,
+            endpoint=first_error.endpoint,
+            vendor_code=first_error.vendor_code,
+            vendor_message=first_error.vendor_message,
+            body_excerpt=(first_error.body_excerpt or "")[:200],
+            task=task,
+        ) from RuntimeError(
+            f"所有已配置密钥的向量供应商都调用失败（task={task}）。尝试记录： " + " || ".join(attempts)
         )
-        await self._record(
-            task,
-            LLMResult(
-                content="",
-                prompt_tokens=result.prompt_tokens,
-                completion_tokens=0,
-                provider=result.provider,
-                model=result.model,
-            ),
-            user_id=user_id,
-            source_id=source_id,
-        )
-        return result
 
     async def _record(
         self,

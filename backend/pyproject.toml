@@ -28,7 +28,6 @@ dependencies = [
   "minio>=7.2.0",
   "pypdf>=5.1.0",
   "Pillow>=11.0.0",
-  "rapidocr-onnxruntime>=1.4.4",
   "numpy>=2.1.0",
   "pgvector>=0.3.6",
   "PyYAML>=6.0.2",
@@ -37,6 +36,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Offline OCR for images / scanned PDFs. Kept optional on purpose: the engine
+# publishes no wheel for Python 3.13+, and OCR_PROVIDER=auto already degrades
+# to a vision model when the engine is absent -- so a 3.13 install must not die
+# on this one package. Python 3.11/3.12 users get it from "backend[dev,ocr]".
+ocr = [
+  "rapidocr-onnxruntime>=1.4.4; python_version < '3.13'",
+]
 stt = [
   "faster-whisper>=1.1.0",
 ]

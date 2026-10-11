@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 
 import httpx
@@ -11,9 +12,37 @@ from app.services.llm.base import (
     ImagePart,
     LLMProvider,
     LLMResult,
+    ProviderHTTPError,
     TextPart,
 )
 from app.utils.text import normalise_text
+
+logger = logging.getLogger("app.llm")
+
+
+def _vendor_error(resp: httpx.Response) -> tuple[str | int | None, str]:
+    """Pull (code, message) out of a vendor's JSON error body.
+
+    SiliconFlow answers `{"code":30003,"message":"Model disabled.","data":null}`;
+    OpenAI-compatible vendors mostly use `{"error":{"message":...}}`. Anything
+    unparseable comes back as an empty message and the caller keeps the raw
+    excerpt, because "403 Forbidden" on its own is never a diagnosis.
+    """
+    try:
+        data = resp.json()
+    except Exception:
+        return None, ""
+    if isinstance(data, dict):
+        code = data.get("code")
+        message = data.get("message") or data.get("error_msg") or ""
+        err = data.get("error")
+        if isinstance(err, dict) and not message:
+            message = err.get("message") or ""
+            code = code or err.get("code") or err.get("type")
+        if not message and isinstance(err, str):
+            message = err
+        return (code if code not in (None, "") else None), str(message or "")
+    return None, ""
 
 
 def _content_parts(content) -> str | list[dict]:
@@ -66,6 +95,55 @@ class OpenAICompatibleProvider(LLMProvider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
+    def _client(self, *, trust_env: bool | None = None) -> httpx.AsyncClient:
+        """HTTP client with a short connect timeout and optional proxy support.
+
+        `connect=5` matters: an unreachable or black-holed endpoint used to hold
+        the ingest for the full 120s read timeout. A dead host now fails in ~5s
+        so the router can try another provider immediately.
+
+        `trust_env` decides whether HTTP(S)_PROXY is honoured. It stays on by
+        default (that is how corporate networks work), and `_post` retries once
+        *without* it when the proxied attempt fails -- a stale or half-dead
+        local proxy exported into the environment otherwise makes every vendor
+        look offline ("All connection attempts failed").
+        """
+        if trust_env is None:
+            configured = os.environ.get("LLM_TRUST_ENV", "1").strip().lower()
+            trust_env = configured not in ("0", "false", "no", "off")
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=self.timeout, write=30.0, pool=5.0),
+            trust_env=trust_env,
+        )
+
+    async def _post(self, url: str, payload: dict, model: str, task: str) -> httpx.Response:
+        """POST with one proxy-less retry, mapping every transport failure."""
+        attempts = [None]
+        env_flag = os.environ.get("LLM_TRUST_ENV", "1").strip().lower()
+        if env_flag not in ("0", "false", "no", "off"):
+            attempts.append(False)          # second try: ignore proxy settings
+        last: Exception | None = None
+        for trust_env in attempts:
+            try:
+                async with self._client(trust_env=trust_env) as client:
+                    return await client.post(url, headers=self._headers(), json=payload)
+            except httpx.TransportError as exc:
+                last = exc
+                if trust_env is None:
+                    logger.info(
+                        "%s %s unreachable via the environment proxy configuration; retrying direct",
+                        self.name,
+                        task,
+                    )
+        raise ProviderHTTPError(
+            status_code=0,
+            provider=self.name,
+            model=model,
+            endpoint=url,
+            vendor_message=f"{type(last).__name__}: {last}",
+            task=task,
+        ) from last
+
     async def complete(
         self,
         *,
@@ -81,14 +159,24 @@ class OpenAICompatibleProvider(LLMProvider):
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
         # trust_env=True (default) honors HTTP(S)_PROXY — never hardcode a proxy
-        async with httpx.AsyncClient(timeout=self.timeout, trust_env=True) as client:
-            resp = await client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self._headers(),
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        endpoint = f"{self.base_url}/chat/completions"
+        # Transport failures (DNS, refused, TLS, timeout) come back in the same
+        # shape as HTTP errors so the router can fall back to another provider;
+        # an unreachable endpoint used to abort the whole ingest instead.
+        resp = await self._post(endpoint, payload, model, task)
+        if resp.status_code >= 400:
+                code, message = _vendor_error(resp)
+                raise ProviderHTTPError(
+                    status_code=resp.status_code,
+                    provider=self.name,
+                    model=model,
+                    endpoint=f"{self.base_url}/chat/completions",
+                    vendor_code=code,
+                    vendor_message=message,
+                    body_excerpt=resp.text or "",
+                    task=task,
+                )
+        data = resp.json()
         # Most vendors return a plain string, but some vision models reply with a
         # content array. Accept both so an OCR call never dies on shape.
         raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
@@ -118,19 +206,21 @@ class OpenAICompatibleProvider(LLMProvider):
                 "Set LLM_PROVIDER_EMBED to siliconflow (BAAI/bge-m3) or dashscope "
                 "(text-embedding-v3), or fill in the Embedding API in 设置."
             )
-        async with httpx.AsyncClient(timeout=self.timeout, trust_env=True) as client:
-            resp = await client.post(
-                f"{self.base_url}/embeddings",
-                headers=self._headers(),
-                json={"model": model, "input": texts},
-            )
-            if resp.status_code >= 400:
-                detail = (resp.text or "")[:300]
-                raise RuntimeError(
-                    f"{self.name} embeddings {resp.status_code}: {detail}"
+        endpoint = f"{self.base_url}/embeddings"
+        resp = await self._post(endpoint, {"model": model, "input": texts}, model, task)
+        if resp.status_code >= 400:
+                code, message = _vendor_error(resp)
+                raise ProviderHTTPError(
+                    status_code=resp.status_code,
+                    provider=self.name,
+                    model=model,
+                    endpoint=f"{self.base_url}/embeddings",
+                    vendor_code=code,
+                    vendor_message=message,
+                    body_excerpt=resp.text or "",
+                    task=task,
                 )
-            resp.raise_for_status()
-            data = resp.json()
+        data = resp.json()
         items = sorted(data.get("data") or [], key=lambda x: x.get("index", 0))
         vectors = [item["embedding"] for item in items]
         usage = data.get("usage") or {}

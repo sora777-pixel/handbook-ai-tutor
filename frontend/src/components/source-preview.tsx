@@ -1,7 +1,9 @@
 "use client";
 
 import { forwardRef, useCallback, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { EpubReader } from "@/components/epub-reader";
 import { Button } from "@/components/ui/button";
+import { emitReaderJump } from "@/lib/reader-bus";
 import type { Citation } from "@/lib/types";
 
 export type SourcePreviewHandle = {
@@ -28,12 +30,15 @@ export const SourcePreview = forwardRef<
     fileUrl: string;
     kind?: string;
     filename?: string | null;
+    /** Required for the EPUB reader: it fetches chapters from the API. */
+    sourceId?: string;
     onError?: (message: string) => void;
   }
->(function SourcePreview({ fileUrl, kind, filename, onError }, ref) {
+>(function SourcePreview({ fileUrl, kind, filename, sourceId, onError }, ref) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [pdfPage, setPdfPage] = useState<number | null>(null);
   const isVideo = kind === "video";
+  const isEpub = kind === "epub";
 
   const pdfUrl = useMemo(
     () => (pdfPage && fileUrl ? `${fileUrl}#page=${pdfPage}` : fileUrl),
@@ -57,10 +62,24 @@ export const SourcePreview = forwardRef<
   const jumpToCitation = useCallback(
     (citation: Citation) => {
       const target = jumpTarget(citation);
-      if (target.time != null) seek(target.time);
-      else if (target.page != null) jumpToPage(target.page);
+      if (target.time != null) {
+        seek(target.time);
+        return;
+      }
+      if (isEpub) {
+        // For a book, `page_number` is the chapter ordinal, and `section_title`
+        // is the chapter name. The reader resolves either one and highlights the
+        // matching TOC row, which a raw page jump could never do.
+        emitReaderJump({
+          chapter: target.page != null ? target.page - 1 : null,
+          title: citation.section_title ?? null,
+          from: "citation",
+        });
+        return;
+      }
+      if (target.page != null) jumpToPage(target.page);
     },
-    [seek, jumpToPage]
+    [isEpub, seek, jumpToPage]
   );
 
   useImperativeHandle(ref, () => ({ seek, jumpToPage, jumpToCitation }), [seek, jumpToPage, jumpToCitation]);
@@ -73,7 +92,7 @@ export const SourcePreview = forwardRef<
       <div className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
         <span className="flex items-center gap-2 text-sm font-medium">
           原文
-          {!isVideo && pdfPage != null && (
+          {!isVideo && !isEpub && pdfPage != null && (
             <button
               type="button"
               onClick={() => setPdfPage(null)}
@@ -117,6 +136,11 @@ export const SourcePreview = forwardRef<
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={fileUrl} alt={filename || "source"} className="mx-auto block max-w-full" />
           </div>
+        ) : isEpub ? (
+          /* Inline reader: no iframe (which showed the browser's own
+             "拒绝连接" page and went blank on chapter switches) and no download
+             dialog -- the book is simply rendered in place. */
+          <EpubReader sourceId={sourceId ?? ""} onError={onError} />
         ) : fileUrl ? (
           <iframe
             key={pdfUrl}

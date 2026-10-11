@@ -248,6 +248,13 @@ def chunk_document(doc: DocumentLayout) -> list[RawChunk]:
 
     last_caption = ""
     last_caption_page = -1
+    #: Section the reader is currently inside. Blocks that arrive without their
+    #: own `section_path` (a paragraph two pages after its heading, an appendix
+    #: table) inherit it, so no chunk is ever section-less. Without this, "跳到
+    #: 对应章节" had nothing to jump to and sections looked shuffled.
+    current_section = ""
+    current_level: int | None = None
+
     for block in doc.blocks:
         if block.content_type == CAPTION:
             last_caption = block.content.strip() or last_caption
@@ -257,6 +264,16 @@ def chunk_document(doc: DocumentLayout) -> list[RawChunk]:
         content = block.content.strip()
         if not content:
             continue
+        if block.content_type == HEADING:
+            current_section = block.section_path or content
+            current_level = block.heading_level
+        elif block.section_path:
+            # The parser knows better than the running state (e.g. it matched a
+            # printed TOC entry): trust it and carry it forward.
+            current_section = block.section_path
+            current_level = block.heading_level or current_level
+        section_path = block.section_path or current_section
+        heading_level = block.heading_level or (current_level if section_path else None)
 
         if block.content_type in ATOMIC_TYPES:
             # Headings, captions, formulas and table/figure grids are single
@@ -280,19 +297,19 @@ def chunk_document(doc: DocumentLayout) -> list[RawChunk]:
             body = piece
             if caption and block.content_type in ("table", "figure", "formula"):
                 body = f"{caption}\n{piece}"
-            if block.section_path:
-                body = f"【{block.section_path}】\n{body}"
+            if section_path:
+                body = f"【{section_path}】\n{body}"
             chunks.append(
                 RawChunk(
                     content=body,
                     page_number=block.page_number,
                     printed_page=block.printed_page,
-                    section_title=block.section_path,
+                    section_title=section_path,
                     content_type=block.content_type,
                     locator=_locator(
-                        block.page_number, block.printed_page, block.section_path, block.content_type
+                        block.page_number, block.printed_page, section_path, block.content_type
                     ),
-                    heading_level=block.heading_level,
+                    heading_level=heading_level,
                 )
             )
     return chunks or [RawChunk(content="[no text]", page_number=1, locator="p.1")]

@@ -72,7 +72,7 @@ async def test_register_provisions_the_three_folder_workspace(client: AsyncClien
     headers = await auth_header(client, email="ws-reg@example.com", password=PASSWORD)
     me = await _me(client, headers)
 
-    root = workspace_dir(UUID(me["id"]))
+    root = workspace_dir(UUID(me["id"]), me["email"])
     assert root.is_dir(), root
     for name in SUBDIRS:
         assert (root / name).is_dir(), f"missing {name}/ under {root}"
@@ -89,7 +89,7 @@ async def test_account_file_never_carries_a_password(client: AsyncClient) -> Non
     """Neither the plaintext nor the bcrypt hash may be copied into the folder."""
     headers = await auth_header(client, email="ws-secret@example.com", password=PASSWORD)
     me = await _me(client, headers)
-    root = workspace_dir(UUID(me["id"]))
+    root = workspace_dir(UUID(me["id"]), me["email"])
 
     async with SessionLocal() as session:
         user = (
@@ -112,7 +112,7 @@ async def test_login_recreates_a_hand_deleted_workspace(client: AsyncClient) -> 
 
     headers = await auth_header(client, email="ws-heal@example.com", password=PASSWORD)
     me = await _me(client, headers)
-    root = workspace_dir(UUID(me["id"]))
+    root = workspace_dir(UUID(me["id"]), me["email"])
     assert root.is_dir()
 
     shutil.rmtree(root)
@@ -134,8 +134,8 @@ async def test_workspace_is_private_to_each_account(client: AsyncClient) -> None
     me_b = await _me(client, b)
 
     assert me_a["id"] != me_b["id"]
-    dir_a = workspace_dir(UUID(me_a["id"]))
-    dir_b = workspace_dir(UUID(me_b["id"]))
+    dir_a = workspace_dir(UUID(me_a["id"]), me_a["email"])
+    dir_b = workspace_dir(UUID(me_b["id"]), me_b["email"])
     assert dir_a != dir_b
     assert dir_a.is_dir() and dir_b.is_dir()
 
@@ -161,11 +161,18 @@ async def test_uploaded_original_lands_in_the_owners_resources_folder(client: As
     assert resp.status_code == 200, resp.text
     source_id = resp.json()["id"]
 
-    stored = workspace_dir(UUID(me["id"])) / "resources" / source_id / "lesson.pdf"
+    from app.services.workspace import safe_object_name
+
+    stored = (
+        workspace_dir(UUID(me["id"]), me["email"])
+        / "resources"
+        / source_id
+        / safe_object_name(source_id, "lesson.pdf")
+    )
     assert stored.is_file(), f"original not under resources/: {stored}"
     assert stored.stat().st_size > 0
     # And it really is inside the account's own folder, not a shared directory.
-    assert workspace_dir(UUID(me["id"])) in stored.parents
+    assert workspace_dir(UUID(me["id"]), me["email"]) in stored.parents
 
 
 @pytest.mark.asyncio
@@ -181,7 +188,7 @@ async def test_deleting_the_last_source_keeps_the_three_folders(client: AsyncCli
     dele = await client.delete(f"/api/v1/sources/{source_id}?delete_files=true", headers=headers)
     assert dele.status_code == 200, dele.text
 
-    root = workspace_dir(UUID(me["id"]))
+    root = workspace_dir(UUID(me["id"]), me["email"])
     for name in SUBDIRS:
         assert (root / name).is_dir(), f"{name}/ disappeared after the last delete"
 
@@ -205,7 +212,7 @@ async def test_quiz_attempt_is_archived_into_records(client: AsyncClient) -> Non
     )
     assert attempt.status_code == 200, attempt.text
 
-    records = workspace_dir(UUID(me["id"])) / "records"
+    records = workspace_dir(UUID(me["id"]), me["email"]) / "records"
     quiz_file = records / "quiz_records.json"
     assert quiz_file.is_file(), f"成绩未归档: {sorted(p.name for p in records.glob('*'))}"
 
@@ -231,7 +238,7 @@ async def test_export_endpoint_writes_every_record_snapshot(client: AsyncClient)
     assert set(body["exported"]) >= {"sources", "notes", "quizzes", "attempts", "token_usages"}
     assert body["workspace"]["exists"] is True
 
-    records = workspace_dir(UUID(me["id"])) / "records"
+    records = workspace_dir(UUID(me["id"]), me["email"]) / "records"
     for name in ("study_notes.json", "quiz_records.json", "tutor_qa.json", "usage.json", "overview.json"):
         assert (records / name).is_file(), f"missing records/{name}"
 

@@ -68,7 +68,7 @@ def resolve_ffmpeg_tool(tool: str) -> str:
         "未找到 ffmpeg/ffprobe，无法从视频提取音频。"
         "请把 ffmpeg.exe 与 ffprobe.exe 放到项目的 tools\\ffmpeg\\bin "
         f"（当前探测目录：{bundled}）。"
-        "双击 start.vbs 会尝试自动下载到该目录，然后重新导入视频。"
+        "双击 start.bat 会尝试自动下载到该目录，然后重新导入视频。"
         "不要把 ffmpeg 加到系统 PATH。"
         " ffmpeg/ffprobe not found; put the binaries in tools/ffmpeg/bin "
         f"(probed {bundled}) or set FFMPEG_DIR. start.bat downloads them there. "

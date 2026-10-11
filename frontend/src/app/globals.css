@@ -328,3 +328,43 @@
     scroll-behavior: auto !important;
   }
 }
+
+
+/* ---------------------------------------------------------------------------
+   EPUB body: the book's own XHTML is injected into the reader, so its plain
+   tags need defaults here (the book's <style> blocks are stripped server-side
+   as a security measure). Mirrors the typography of the iframe shell the reader
+   used before, minus the frame.
+   --------------------------------------------------------------------------- */
+.epub-body {
+  color: #1f2328;
+  font-family: Georgia, "Songti SC", "Noto Serif CJK SC", serif;
+  line-height: 1.85;
+}
+.epub-body h1, .epub-body h2, .epub-body h3, .epub-body h4 {
+  line-height: 1.35;
+  margin: 1.4em 0 0.6em;
+}
+.epub-body h1, .epub-body h2 { text-align: center; }
+.epub-body p { margin: 0.85em 0; text-align: justify; }
+.epub-body img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
+.epub-body figure { margin: 1.4em 0; }
+.epub-body figcaption { font-size: 0.85em; color: #6b7280; text-align: center; }
+.epub-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.2em 0;
+  display: block;
+  overflow-x: auto;
+  font-size: 0.92em;
+}
+.epub-body td, .epub-body th { border: 1px solid #d8d2c4; padding: 6px 9px; }
+.epub-body th { background: #f4efe3; }
+.epub-body blockquote {
+  margin: 1em 1.4em;
+  color: #555;
+  border-left: 3px solid #d8d2c4;
+  padding-left: 12px;
+}
+.epub-body a { color: #2f6f4f; text-decoration: underline; }
+.epub-body pre { white-space: pre-wrap; word-break: break-word; }

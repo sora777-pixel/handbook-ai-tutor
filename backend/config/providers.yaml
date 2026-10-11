@@ -83,7 +83,12 @@ providers:
       notes_generate: Qwen/Qwen2.5-7B-Instruct
       segment_summarize: Qwen/Qwen2.5-7B-Instruct
       embed: BAAI/bge-m3
-      transcribe_image: Qwen/Qwen2.5-VL-72B-Instruct
+      # Verified against the live API on 2026-10-09: Qwen/Qwen2.5-VL-72B-Instruct
+      # and Qwen/Qwen2.5-VL-32B-Instruct now answer HTTP 403 {"code":30003,
+      # "message":"Model disabled."} — SiliconFlow retired them. Qwen3-VL works.
+      # If this ever 403s again, the model was retired upstream: run a 1-token
+      # probe against a candidate id and update this line (see 调研报告).
+      transcribe_image: Qwen/Qwen3-VL-32B-Instruct
 
   openai:
     type: openai_compatible

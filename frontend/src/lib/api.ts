@@ -35,7 +35,8 @@ export const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost
 function unreachable(): Error {
   return new Error(
     `无法连接后端服务（${apiBase}）· Backend unreachable. ` +
-      "请先启动后端：双击项目根目录的 start.vbs，然后刷新本页。",
+      "请双击项目根目录的 start.bat 重新启动，" +
+      "等待控制台显示 Ready 后再刷新本页。",
   );
 }
 

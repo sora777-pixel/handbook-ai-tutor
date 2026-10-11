@@ -379,20 +379,28 @@ class VisionOcr:
             return f"vision (unavailable: {exc})"
 
     async def transcribe(self, images, *, user_id=None, source_id=None) -> OcrResult:
+        """Read every page concurrently, bounded, and keep them in page order.
+
+        This loop used to run one page at a time: a 200-page scanned textbook
+        meant 200 sequential vision calls, which is most of the "解析很慢"
+        experience. With a small pool the same book finishes several times
+        faster, and one bad page still only costs its own row.
+        """
         settings = get_settings()
         max_side = max(320, int(settings.ocr_vision_max_side or 1800))
+        limit = max(1, int(getattr(settings, "ocr_concurrency", 3) or 3))
         pages: list[OcrPage] = []
         notes: list[str] = []
         provider_name = ""
         model_name = ""
 
-        for page_number, data in images:
+        async def read_page(page_number: int, data: bytes) -> OcrPage:
+            nonlocal provider_name, model_name
             try:
                 image = normalise_image(data, max_side=max_side)
             except Exception as exc:
-                pages.append(OcrPage(page_number, "", None))
                 notes.append(f"page {page_number}: unreadable image ({type(exc).__name__})")
-                continue
+                return OcrPage(page_number, "", None)
             message = ChatMessage.user_with_image(
                 f"{TRANSCRIBE_PROMPT}\n\nThis is page {page_number}.", to_data_url(image)
             )
@@ -405,7 +413,23 @@ class VisionOcr:
             )
             provider_name = result.provider
             model_name = result.model
-            pages.append(OcrPage(page_number, (result.content or "").strip(), None))
+            return OcrPage(page_number, (result.content or "").strip(), None)
+
+        semaphore = asyncio.Semaphore(limit)
+
+        async def guarded(page_number: int, data: bytes) -> OcrPage:
+            async with semaphore:
+                return await read_page(page_number, data)
+
+        results = await asyncio.gather(
+            *(guarded(number, blob) for number, blob in images), return_exceptions=True
+        )
+        for (page_number, _blob), outcome in zip(images, results, strict=False):
+            if isinstance(outcome, BaseException):
+                notes.append(f"page {page_number}: OCR failed ({type(outcome).__name__}: {outcome})")
+                pages.append(OcrPage(page_number, "", None))
+            else:
+                pages.append(outcome)
 
         return OcrResult(
             pages=pages,

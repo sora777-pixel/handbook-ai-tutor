@@ -82,7 +82,7 @@ async def extract_audio(video_bytes: bytes, suffix: str = ".mp4") -> tuple[Path,
         raise FFmpegMissing(
             "未找到 ffmpeg，无法从视频提取音频。"
             "请把 ffmpeg.exe 与 ffprobe.exe 放到项目的 tools\\ffmpeg\\bin\\ "
-            "（双击 start.vbs 会尝试自动下载），然后重新导入。"
+            "（双击 start.bat 会尝试自动下载），然后重新导入。"
         ) from exc
     _, stderr = await proc.communicate()
     if proc.returncode != 0 or not wav_path.exists():

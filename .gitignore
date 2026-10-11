@@ -86,3 +86,10 @@ backend/models/ocr/*.part
 backend/_uvicorn.log
 backend/_e2e_layout.log
 frontend/_next.log
+
+# 本地运行产物 / 数据库快照（不入库）
+/package-lock.json
+*.db.bak*
+*.db-wal
+*.db-shm
+_cleanup-backup-*/

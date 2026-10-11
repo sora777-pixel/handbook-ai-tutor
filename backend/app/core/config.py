@@ -103,6 +103,16 @@ class Settings(BaseSettings):
     s3_secure: bool = False
 
     task_backend: str = "inline"  # arq | inline
+    #: How many files may be parsed at the same time in one process. Uploads are
+    #: concurrent by design; this only bounds the width so a folder full of
+    #: files queues up instead of stampeding the LLM provider and SQLite.
+    ingest_concurrency: int = 3
+    #: How many pages a vision OCR call may read at once. Scanned textbooks are
+    #: page-serial by nature; a small pool is the difference between minutes
+    #: and tens of minutes. Keep it modest -- each request carries an image.
+    ocr_concurrency: int = 3
+    #: How many video summary windows may be in flight at once.
+    summarize_concurrency: int = 4
     storage_backend: str = "local"  # minio | local
     # Absolute, and deliberately inside the project folder: every account gets
     # <root>/<user_id>/{profile,records,resources} without anyone having to edit

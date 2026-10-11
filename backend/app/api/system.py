@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -39,6 +40,67 @@ from app.services.workspace import export_records, workspace_report
 logger = logging.getLogger("app.paths")
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
+
+
+# ------------------------------------------------------------- session beat
+#
+# The local launcher (start.bat) starts a watchdog that stops the backend and
+# the frontend once the browser UI is closed. A port probe cannot detect that
+# -- `next start` keeps answering long after the last tab is gone -- so the
+# page reports in (see frontend/src/components/session-heartbeat.tsx) and the
+# watchdog reads the answer.
+#
+# The channel is a FILE, not HTTP: scripts/session_watchdog.ps1 only reads
+# tmp\last_beat. Anything that blocks a PowerShell web call (proxy, antivirus,
+# corporate policy) would otherwise make a healthy backend look dead and get a
+# running app killed. A file read cannot be blocked that way.
+#
+# The endpoint stays available for humans and for tests; it simply is not on
+# the critical path any more. It is unauthenticated by design: a liveness ping
+# with no user data, and the launcher binds the server to 127.0.0.1.
+
+BEAT_INTERVAL_SECONDS = 15
+
+_started_at = time.time()
+_last_beat: float | None = None
+_beats = 0
+
+
+def _beat_file() -> Path:
+    """Where the watchdog looks for the last heartbeat."""
+    return Path(REPO_ROOT) / "tmp" / "last_beat"
+
+
+def _write_beat_file(value: float) -> None:
+    try:
+        path = _beat_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{value:.3f}", encoding="ascii")
+    except OSError as exc:  # never fail a ping because of a file
+        logger.debug("could not write %s: %s", _beat_file(), exc)
+
+
+@router.post("/heartbeat")
+async def post_heartbeat() -> dict[str, Any]:
+    """Record that a browser tab is still open."""
+    global _last_beat, _beats
+    _last_beat = time.time()
+    _beats += 1
+    _write_beat_file(_last_beat)
+    return {"ok": True, "interval_seconds": BEAT_INTERVAL_SECONDS}
+
+
+@router.get("/heartbeat")
+async def get_heartbeat() -> dict[str, Any]:
+    """How long since the last beat (informational; the watchdog reads the file)."""
+    now = time.time()
+    return {
+        "seconds_since_beat": round(now - _last_beat, 1) if _last_beat else None,
+        "seconds_since_start": round(now - _started_at, 1),
+        "beats": _beats,
+        "beat_file": str(_beat_file()),
+        "auto_stop_after_seconds": os.environ.get("AUTO_STOP_IDLE_SECONDS", "180"),
+    }
 
 
 class PathsIn(BaseModel):
@@ -85,6 +147,13 @@ def _validate_directory(raw: str, field: str) -> str:
     Every filesystem call is wrapped: a mapped-but-offline drive, a permission
     wall or a path the OS refuses to stat must surface as a readable 400, not as
     an unhandled OSError that the browser renders as "Internal Server Error".
+
+    The write probe is *tolerant*: a single antivirus or search-indexer touch can
+    make an instantly-created file unopenable for a moment, and Windows then
+    reports the raw "The process cannot access the file because it is being used
+    by another process" -- which says nothing about the directory and made the
+    settings page look broken. So the probe retries with a unique name, and a
+    leftover probe file is not treated as failure.
     """
     path = Path(raw).expanduser()
     _check_common(path, field)
@@ -92,9 +161,30 @@ def _validate_directory(raw: str, field: str) -> str:
         if path.exists() and not path.is_dir():
             raise _reject(f"{path} 已经是一个文件，不能作为目录使用。", field=field)
         path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".write-probe"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
+        last_exc: OSError | None = None
+        for attempt in range(5):
+            probe = path / f".write-probe-{os.getpid()}-{attempt}"
+            try:
+                probe.write_text("ok", encoding="utf-8")
+            except OSError as exc:
+                last_exc = exc
+                time.sleep(0.15)
+                continue
+            try:
+                probe.unlink()
+            except OSError:
+                # Locked by a scanner: harmless, it is a 2-byte dotfile. Never
+                # fail the user's save because cleanup was refused.
+                logger.info("write probe left behind (locked): %s", probe)
+            last_exc = None
+            break
+        if last_exc is not None:
+            raise _reject(
+                f"目录 {path} 暂时无法写入（{last_exc.strerror or last_exc}）。"
+                "常见原因是杀毒软件/搜索索引正在扫描该目录，稍等几秒再保存；"
+                "也可以换一个目录（例如放在用户文件夹下）后重试。",
+                field=field,
+            )
         resolved = str(path.resolve())
     except HTTPException:
         raise
@@ -445,7 +535,7 @@ async def get_workspace(user: User = Depends(get_current_user)) -> dict[str, Any
     Read-only: the three sub-folders are created on registration and refreshed
     on every login, so this is a diagnostic rather than a control.
     """
-    return workspace_report(user.id)
+    return workspace_report(user.id, user.email)
 
 
 @router.post("/workspace/export")
@@ -459,5 +549,5 @@ async def export_workspace(
     current records out now" button, and it reports both the row counts that
     were mirrored and the resulting folder shape.
     """
-    counts = await export_records(db, user.id)
-    return {"exported": counts, "workspace": workspace_report(user.id)}
+    counts = await export_records(db, user.id, user.email)
+    return {"exported": counts, "workspace": workspace_report(user.id, user.email)}

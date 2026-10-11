@@ -33,11 +33,21 @@ def fresh_settings():
 
 
 def _router_without_vision_keys(monkeypatch) -> ModelRouter:
-    """A router whose only usable key belongs to a text-only vendor."""
+    """A router whose only usable key belongs to a text-only vendor.
+
+    `LLM_PROVIDER_VISION` is cleared explicitly: a real machine pins it in .env
+    (siliconflow, so image OCR always lands on a vision model), and that setting
+    would otherwise make these tests assert the opposite of what they describe.
+    """
     for env in VISION_KEY_ENVS:
         monkeypatch.delenv(env, raising=False)
+    monkeypatch.delenv("LLM_PROVIDER_VISION", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER_VISION", "")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek-key-0000000000")
     monkeypatch.setenv("LLM_DEFAULT_PROVIDER", "deepseek")
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
     return ModelRouter()
 
 
@@ -82,6 +92,7 @@ def test_vision_route_available_explains_instead_of_crashing(monkeypatch):
 
 def test_vision_provider_used_when_one_really_has_a_vision_model(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("LLM_PROVIDER_VISION", "")   # let discovery pick
     monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-dashscope-key-0000000")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-deepseek-key-0000000000")
     monkeypatch.setenv("LLM_DEFAULT_PROVIDER", "deepseek")

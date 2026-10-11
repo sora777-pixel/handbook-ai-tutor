@@ -21,6 +21,12 @@ import {
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
 import { ExtractionNote } from "@/components/extraction-note";
+import {
+  UploadDropzone,
+  UploadQueue,
+  uploadMany,
+  type UploadRow,
+} from "@/components/upload-batch";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -57,12 +63,11 @@ export default function DashboardPage() {
   const queryClient = useQueryClient();
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [dragOver, setDragOver] = useState(false);
+  const [queue, setQueue] = useState<UploadRow[]>([]);
   const [pendingDelete, setPendingDelete] = useState<Source | null>(null);
   const [lastReport, setLastReport] = useState<SourceDeleteReport | null>(null);
   const [liveTasks, setLiveTasks] = useState<Record<string, TaskEvent>>({});
   const [streaming, setStreaming] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!token) router.replace("/login");
@@ -133,30 +138,36 @@ export default function DashboardPage() {
     },
   });
 
-  async function onFile(file: File) {
-    setUploading(true);
+  /**
+   * Several files at once. Each one is POSTed independently and reports its own
+   * verdict, so a rejected file never cancels the rest. A single file keeps the
+   * old behaviour (jump straight into it); a batch stays here, where the queue
+   * below and the source list show what is happening.
+   */
+  async function onFiles(files: File[]) {
+    if (!files.length) return;
     setError(null);
+    setUploading(true);
+    const single = files.length === 1;
+    if (single) setQueue([]);
     try {
-      const body = new FormData();
-      body.append("file", file);
-      const created = await api<Source & { task_id?: string }>("/api/v1/sources/upload", {
-        method: "POST",
-        body,
+      const outcome = await uploadMany(files, (row) => {
+        setQueue((prev) => {
+          const rest = prev.filter((r) => r.id !== row.id);
+          return single && row.state !== "accepted" ? prev : [...rest, row];
+        });
       });
-      router.push(`/sources/${created.id}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Upload failed");
+      if (single && outcome.lastSourceId) {
+        router.push(`/sources/${outcome.lastSourceId}`);
+        return;
+      }
+      if (outcome.failed > 0) {
+        setError(`${outcome.ok} 个已进入解析，${outcome.failed} 个失败：见下方列表。`);
+      }
+      queryClient.invalidateQueries({ queryKey: ["sources"] });
     } finally {
       setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
-  }
-
-  function onDrop(e: React.DragEvent) {
-    e.preventDefault();
-    setDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) void onFile(file);
   }
 
   return (
@@ -174,63 +185,23 @@ export default function DashboardPage() {
               <div>
                 <CardTitle className="text-lg">上传学习资料</CardTitle>
                 <CardDescription className="mt-1">
-                  PDF / MP4 / 图片。上传后进入异步流水线：解析 → 知识点梳理 → 可检索索引。
+                  PDF / MP4 / EPUB / 图片。上传后进入异步流水线：解析 → 知识点梳理 → 可检索索引。
                 </CardDescription>
               </div>
               <Badge variant="soft">
                 <Sparkles className="h-3 w-3" />
-                支持 .pdf / .mp4 / .png / .jpg
+                支持 .pdf / .mp4 / .epub / .png / .jpg
               </Badge>
             </div>
           </CardHeader>
           <CardContent>
-            <label
-              onDragOver={(e) => {
-                e.preventDefault();
-                setDragOver(true);
-              }}
-              onDragLeave={() => setDragOver(false)}
-              onDrop={onDrop}
-              className={[
-                "group relative flex cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border-2 border-dashed px-6 py-10 text-center transition-all duration-200",
-                dragOver
-                  ? "border-primary bg-primary/5 scale-[1.01]"
-                  : "border-border bg-muted/30 hover:border-primary/50 hover:bg-primary/[0.03]",
-                uploading && "pointer-events-none opacity-60",
-              ].join(" ")}
-            >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".pdf,.mp4,.png,.jpg,.jpeg,application/pdf,video/mp4,image/png,image/jpeg"
-                disabled={uploading}
-                className="sr-only"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) void onFile(file);
-                }}
-              />
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-brand text-white shadow-glow transition-transform group-hover:scale-110">
-                {uploading ? (
-                  <Loader2 className="h-7 w-7 animate-spin" />
-                ) : (
-                  <UploadCloud className="h-7 w-7" />
-                )}
+            <UploadDropzone busy={uploading} onFiles={(files) => void onFiles(files)} />
+
+            {queue.length > 0 && (
+              <div className="mt-3">
+                <UploadQueue rows={queue} />
               </div>
-              <div className="space-y-1">
-                <p className="text-base font-medium">
-                  {uploading ? "上传中，正在入队…" : "点击或拖拽文件到这里"}
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  支持 PDF 课件、MP4 课程录像、扫描版教材截图
-                </p>
-              </div>
-              {!uploading && (
-                <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
-                  选择文件
-                </span>
-              )}
-            </label>
+            )}
             {error && (
               <div
                 role="alert"

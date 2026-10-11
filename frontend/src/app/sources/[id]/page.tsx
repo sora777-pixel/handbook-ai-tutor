@@ -398,6 +398,7 @@ export default function SourcePage() {
           fileUrl={fileUrl}
           kind={kind}
           filename={source.data?.filename}
+          sourceId={id}
           onError={(text) => setBanner({ kind: "err", text })}
         />
 

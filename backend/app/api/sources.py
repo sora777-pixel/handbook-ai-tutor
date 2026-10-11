@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+import zipfile
 from io import BytesIO
 from uuid import UUID, uuid4
 
@@ -38,15 +39,18 @@ from app.models.user import User
 from app.services.library import delete_source_cascade
 from app.services.queue import get_queue
 from app.services.storage import get_storage
-from app.services.workspace import ensure_workspace, resource_key
+from app.services.workspace import ensure_workspace, read_source_bytes, resource_key, storage_candidates
 
 router = APIRouter(prefix="/api/v1/sources", tags=["sources"])
 
 # Scope A originally accepted PDF + MP4 only, which rejected photos and scans of
 # textbook pages outright. Images now go through the OCR stage like a scanned PDF.
+# EPUB joins the same ingest pipeline as a third first-class kind: its XHTML
+# chapters carry real structure, so they need no OCR and no layout heuristics.
 ALLOWED: dict[str, str] = {
     "application/pdf": "pdf",
     "video/mp4": "video",
+    "application/epub+zip": "epub",
     "image/png": "image",
     "image/jpeg": "image",
     "image/webp": "image",
@@ -58,6 +62,7 @@ ALLOWED: dict[str, str] = {
 EXTENSION_KINDS: dict[str, str] = {
     ".pdf": "pdf",
     ".mp4": "video",
+    ".epub": "epub",
     ".png": "image",
     ".jpg": "image",
     ".jpeg": "image",
@@ -68,7 +73,7 @@ EXTENSION_KINDS: dict[str, str] = {
     ".tiff": "image",
 }
 
-SUPPORTED_HINT = "PDF, MP4, PNG, JPG, JPEG, WEBP, GIF, BMP or TIFF"
+SUPPORTED_HINT = "PDF, MP4, EPUB, PNG, JPG, JPEG, WEBP, GIF, BMP or TIFF"
 
 
 def _kind_for(file: UploadFile) -> str:
@@ -96,6 +101,16 @@ async def upload_source(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty file")
+    if kind == "epub":
+        # Fail fast on something renamed to .epub: an EPUB must be a ZIP
+        # container. Deeper checks (DRM, fixed layout, spine) run in the
+        # pipeline where they produce a learner-facing failure message.
+        if not zipfile.is_zipfile(BytesIO(data)):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This file is not a valid EPUB (not a ZIP container). "
+                "Re-export the book as EPUB and try again.",
+            )
     if kind == "image":
         # Fail fast on a corrupt image instead of surfacing it minutes later from
         # deep inside the OCR stage. Image.open is lazy and only reads the header.
@@ -109,8 +124,9 @@ async def upload_source(
                 "Re-export it as PNG or JPG and try again.",
             ) from None
     source_id = uuid4()
-    # The original lands in its owner's own folder: <user_id>/resources/<source_id>/.
-    key = resource_key(user.id, source_id, file.filename)
+    # The original lands in its owner's own folder, named after the account:
+    # data/storage/<username>/resources/<source_id>/<filename>.
+    key = resource_key(user.id, source_id, file.filename, user.email)
     storage = get_storage()
     await storage.ensure_ready()
     await storage.put_bytes(key, data, file.content_type or "application/octet-stream")
@@ -477,15 +493,22 @@ async def download_source_file(
         "Accept-Ranges": "bytes",
     }
 
-    try:
-        size = await storage.size(source.storage_key)
-    except Exception:
-        size = None
+    # A row written before the folder rename still points at <uuid>/...; try the
+    # recorded key first and the legacy key after it, so old uploads keep opening.
+    keys = storage_candidates(source, source.user_id, user.email)
+    size = None
+    for key in keys:
+        try:
+            size = await storage.size(key)
+        except Exception:
+            size = None
+        if size:
+            break
 
     if not size:
         # No size (or an empty object): keep the previous whole-body behaviour.
         try:
-            data = await storage.get_bytes(source.storage_key)
+            data = await read_source_bytes(source, source.user_id, user.email)
         except FileNotFoundError:
             raise HTTPException(status_code=410, detail="File is no longer in storage") from None
         except Exception as exc:
@@ -502,8 +525,17 @@ async def download_source_file(
         status_code = status.HTTP_206_PARTIAL_CONTENT
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
 
+    ranged = keys[-1]
+    for key in keys:
+        try:
+            if await storage.size(key):
+                ranged = key
+                break
+        except Exception:
+            continue
+
     return StreamingResponse(
-        storage.iter_range(source.storage_key, start, length),
+        storage.iter_range(ranged, start, length),
         status_code=status_code,
         media_type=media_type,
         headers=headers,

@@ -87,3 +87,44 @@ async def describe_schema(engine: AsyncEngine) -> dict[str, list[str]]:
                 cols = (await conn.execute(text(f"PRAGMA table_info({name})"))).fetchall()
                 out[name] = [c[1] for c in cols]
     return out
+
+
+async def recover_interrupted_tasks(engine: AsyncEngine) -> dict[str, int]:
+    """Fail tasks that a previous process left running.
+
+    Ingest runs in-process (TASK_BACKEND=inline). When the app is closed while a
+    file is still parsing, that task row keeps `status='running'` forever: the
+    window that would have finished it is gone. The UI then shows a progress bar
+    that never moves again and a source stuck at "解析中", and the only cure was
+    deleting and re-importing by hand.
+
+    Called once at startup: anything still queued/running at boot cannot have an
+    owner, so it is marked failed with an actionable message.
+    """
+    if engine.dialect.name != "sqlite":
+        return {}
+    counts: dict[str, int] = {}
+    async with engine.begin() as conn:
+        sources = await conn.execute(
+            text(
+                "UPDATE sources SET status = 'failed', "
+                "error_message = '解析在应用关闭时被中断，请重新导入该文件' "
+                "WHERE status IN ('queued', 'processing')"
+            )
+        )
+        counts["sources"] = sources.rowcount or 0
+        tasks = await conn.execute(
+            text(
+                "UPDATE tasks SET status = 'failed', step = 'interrupted', progress = 100, "
+                "message = '应用重启时该任务已中断，请重新导入' "
+                "WHERE status IN ('queued', 'running')"
+            )
+        )
+        counts["tasks"] = tasks.rowcount or 0
+    if counts.get("sources") or counts.get("tasks"):
+        logger.info(
+            "recovered interrupted ingest: %s source(s), %s task(s) marked failed",
+            counts.get("sources"),
+            counts.get("tasks"),
+        )
+    return counts

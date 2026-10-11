@@ -95,6 +95,80 @@ class EmbedResult(BaseModel):
     dim: int = Field(default=1536)
 
 
+class ProviderHTTPError(RuntimeError):
+    """A vendor answered with an HTTP error, carrying what it actually said.
+
+    `raise_for_status()` alone produced "Client error '403 Forbidden' for url
+    ..." on the learner-facing task error, which says nothing actionable. The
+    body is the diagnosis: SiliconFlow answers `{"code": 30003, "message":
+    "Model disabled."}`, i.e. the configured checkpoint was switched off
+    upstream -- nothing is wrong with the API key. Without this class nobody
+    can tell "your key is invalid" (401) from "that model is gone" (403) from
+    "that model name never existed" (400/code 20012).
+
+    `worth_another_provider` marks the failures that another vendor can still
+    answer: revoked key, disabled/renamed model, quota, rate limit, upstream
+    outage. A malformed request (400 without a model-related vendor code) is
+    not retried elsewhere -- it would fail identically everywhere.
+    """
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        provider: str,
+        model: str,
+        endpoint: str,
+        vendor_code: str | int | None = None,
+        vendor_message: str = "",
+        body_excerpt: str = "",
+        task: str = "",
+    ) -> None:
+        self.status_code = status_code
+        #: The routed task this call belonged to ("summarize", "embed",
+        #: "transcribe_image", …). Carrying it means the ingest error can name
+        #: the real culprit instead of guessing -- a failed vision OCR was once
+        #: reported as a deepseek text failure.
+        self.task = task
+        self.provider = provider
+        self.model = model
+        self.endpoint = endpoint
+        self.vendor_code = vendor_code
+        self.vendor_message = vendor_message
+        self.body_excerpt = body_excerpt
+
+        bits = [f"{provider}/{model} -> HTTP {status_code}"]
+        if vendor_code not in (None, ""):
+            bits.append(f"code {vendor_code}")
+        detail = vendor_message or body_excerpt
+        if detail:
+            bits.append(detail[:300])
+        super().__init__(" | ".join(bits))
+        self.short = " | ".join(bits)
+
+    @property
+    def worth_another_provider(self) -> bool:
+        if self.status_code == 0:
+            # No HTTP answer at all (DNS, refused, TLS, proxy, timeout). Another
+            # vendor is very often reachable when one host is not.
+            return True
+        if self.status_code in (401, 403, 404, 408, 409, 425, 429):
+            return True
+        if self.status_code >= 500:
+            return True
+        # 400 with a vendor code that names the model / quota is the vendor
+        # saying "I cannot serve this model", which another vendor can.
+        code = str(self.vendor_code or "")
+        if self.status_code == 400 and code in {
+            "20012",  # SiliconFlow: Model does not exist
+            "30003",  # SiliconFlow: Model disabled
+            "20015",
+            "10004",
+        }:
+            return True
+        return False
+
+
 class LLMProvider(ABC):
     """Vendor-agnostic LLM + embedding provider. Business code never imports a vendor SDK."""
 
